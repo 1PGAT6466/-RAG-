@@ -627,3 +627,26 @@
 ### 教训
 - 同类模块（主库 db.py vs 插件库 registry.py）的 _get_conn 配置要统一，不能各写各的；插件库反而做了正确的 busy_timeout，说明当初是分别开发、未对齐
 - SQLite 并发写三件套：WAL + busy_timeout + 显式事务短窗口
+
+## 第十三轮：向量化进度反馈 + rerank 健壮性 + 大图渲染截断（2026-08-18）
+
+### 向量化进度反馈（137MB PDF 干等 40 分钟的核心痛点）
+- embedder.encode 新增 progress_cb(done,total) 回调参数，本地/远程均逐批上报
+- _encode_local 改分批(batch_size=64)编码，不再一次性塞全部阻塞无反馈；远程原 batch_size=32
+- _stage_embed 用 ctx.emit 实时上报「向量化 X/Y 块」；流式路径 on_batch 的 encode 也接回调
+- 验证：100 块 → progress_cb 调 2 次(64/36)，单调递增末次 100
+
+### rerank DeepSeek 打分健壮性
+- json.loads 前先正则提取 {..scores..}（防 LLM 前导说明/代码块包裹），原直接 json.loads(raw) 会因非纯 JSON 崩溃
+- JSON 解析失败/无 scores/空 → 降级返回空（不崩溃）
+- scores 元素 float() 加 try（非数字降级 0.0）
+- 验证：正常/前导说明/代码块均能提取；纯垃圾 NO_MATCH 降级
+
+### 大图渲染截断
+- GraphView 加 applyGraphTruncation：实体图节点 >300 时按 degree 取 Top 核心节点 + 对应边
+- 顶部橙色提示条「节点过多已按关联度显示 Top 300 核心节点」
+- 当前 502 节点/4266 边，d3 forceSimulation 全量 SVG 渲染会卡，截断后流畅
+
+### 教训
+- 本地 CPU 向量化大 batch 是「一次性全塞 + 无进度」的经典反模式：既阻塞又无反馈，让用户误以为卡死；分批 + 进度回调双向解决
+- LLM 结构化输出（JSON 打分）必须防前导文字/代码块包裹 + 非数字元素，纯 json.loads 太脆弱
