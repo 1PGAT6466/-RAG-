@@ -341,6 +341,22 @@
   - 物理 CPU 只有 8 核（AMD Ryzen 7 5700X），GPU 才是提速杠杆
 - 脚本默认已改：workers=4 + det-cap=960（rebuild_pdf_ocr.py main argparse）
 
+## chromadb telemetry 噪音根因与修复（2026-08-18）
+- 现象：服务日志刷屏 `Failed to send telemetry event ClientStartEvent: capture() takes 1 positional argument but 3 were given`
+- 根因：chromadb 0.6.3 按 posthog-python 3.x API 写（`capture(distinct_id, event, props)`），本机却装了 posthog 7.38.0（`capture(event, **kwargs)`），多传 3 个位置参数报错
+- chroma_store.py 早已在 `_get_collection` 传 `settings=ccfg.Settings(anonymized_telemetry=False)`，但 telemetry 在 System.start() 阶段仍会触发，且 posthog 7.x 的 disabled 标志不生效
+- 最终修复（config.py 顶部 load_dotenv 后）：`os.environ.setdefault("ANONYMIZED_TELEMETRY","False")` + 静默 `logging.getLogger("chromadb.telemetry").setLevel(CRITICAL)`（含 product.posthog 子 logger）
+- 关键：环境变量名是 `ANONYMIZED_TELEMETRY`（pydantic BaseSettings 字段转大写），但 chromadb 的 Settings() 作为默认参数在模块 import 时求值，必须最早设置才稳；静默 logger 是双保险
+- 教训：chromadb 0.6.3 + posthog 7.x 是已知不兼容，遥测纯噪音无用，静默 logger 比降级依赖更干净
+
+## 接口响应字段约定（重要，避免重复踩坑）
+- `/api/documents` 返回 `{"status":"ok","data":[...]}`（字段是 `data` 不是 `files`）
+- `/api/search` 返回 `{"status":"ok","data":[...]}`（字段是 `data` 不是 `results`）
+- `/api/entities/graph` 返回 `{"status":"ok","data":{"nodes":[...],"edges":[...]}}`（nodes/edges 在 `data` 内）
+- `/api/plugins` 返回 `{"status":"ok","data":[...]}`
+- 登录返回 `{"access_token":...}`；JWT 生成：`jwt.encode(payload, JWT_SECRET, algorithm='HS256')`，payload 含 sub/user_id/role/exp/iat
+- 写回归脚本时先打印 status + text 前几百字符确认结构，别凭记忆猜字段名
+
 ## 上传链路全自动乱码检测（2026-08-17）
 - **parser.py auto 模式重写**：文本层提取 → 双重检测 → 自动分流，无需人工干预
   - 检测 1（扫描件）：文本层总字数 < 页数×30 → 自动 OCR
@@ -650,3 +666,25 @@
 ### 教训
 - 本地 CPU 向量化大 batch 是「一次性全塞 + 无进度」的经典反模式：既阻塞又无反馈，让用户误以为卡死；分批 + 进度回调双向解决
 - LLM 结构化输出（JSON 打分）必须防前导文字/代码块包裹 + 非数字元素，纯 json.loads 太脆弱
+
+## 第十四轮：整体体检 + Chroma 孤儿向量修复（2026-08-18）
+
+### 体检发现 + 修复：Chroma 孤儿向量（实质问题）
+- 体检发现 Chroma 向量 3186 条 vs SQLite chunks 1644 条，**1542 个孤儿向量**
+- 根因：历史 delete_file 尚未接 Chroma 清理时删除的文件、或反复重建/重传残留，Chroma 遗留已删 chunk 的向量，污染检索（召回旧 chunk 显示空文件名）
+- 当前 delete_file 已正确删 Chroma 向量（有 delete(cid)循环），孤儿是历史遗留
+- 新增 scripts/cleanup_chroma_orphans.py：对比 Chroma id vs SQLite chunks id，只删孤儿，支持 --dry-run，分批删
+- 已执行：3186 -> 1644，与 SQLite 完全一致，ensure_synced 补录 0
+
+### 体检结论（其余均健康）
+- 功能全通过：认证(200/错密码401)、文档列表4/详情/404、实体图谱(502节点/4266边)、文档图谱、检索(中文5条/乱码0条)、对话(正常4源/乱码0源)、插件(2个)、参数校验(空query422/top_k越界422)、未登录401
+- 日志 ERROR 仅 chromadb posthog 遥测报错（capture() takes 1 positional argument but 3 were given，chromadb 0.6.3 已知无害 bug），无业务 Traceback/database is locked
+- 数据库锁问题已彻底解决（前一轮 busy_timeout 修复生效，日志零 locked）
+
+### ⚠️ 持续关注项
+- **C 盘仅剩 9.19GB**（历史记录过 C 盘易满，曾有降到 0 字节的教训），需定期清理 EasyClaw Temp 的 deploy-verify 残留
+- 服务进程内存 1859MB（本地 bge-large 模型常驻 ~1.2GB + Chroma 索引），属正常
+- chromadb posthog 遥测报错刷屏（无害，可后续通过环境变量 ANONYMIZED_TELEMETRY=False 关闭）
+
+### admin 账号
+- admin / admin123；另有 user 账号（密码未探明，不需）

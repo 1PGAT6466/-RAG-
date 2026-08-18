@@ -40,9 +40,17 @@
     </div>
 
     <div class="chat-input-area">
+      <div class="chat-mode-bar">
+        <el-radio-group v-model="mode" size="small">
+          <el-radio-button value="auto">自动</el-radio-button>
+          <el-radio-button value="knowledge">知识库</el-radio-button>
+          <el-radio-button value="chat">闲聊</el-radio-button>
+          <el-radio-button value="web">联网</el-radio-button>
+        </el-radio-group>
+      </div>
       <el-input
         v-model="query"
-        placeholder="输入问题，搜索知识库..."
+        :placeholder="mode === 'web' ? '输入问题，联网搜索实时信息...' : mode === 'chat' ? '自由聊天...' : '输入问题，搜索知识库...'"
         size="large"
         @keyup.enter="send"
         :disabled="loading"
@@ -68,6 +76,7 @@ const loading = ref(false)
 const messages = ref([])
 const msgContainer = ref(null)
 const router = useRouter()
+const mode = ref('auto')
 
 marked.setOptions({ breaks: true })
 
@@ -157,8 +166,10 @@ async function send() {
   query.value = ''
   loading.value = true
   await scrollToBottom()
+  // 组装多轮历史（传给闲聊模式做上下文）
+  const history = messages.value.slice(0, -1).map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content }))
   try {
-    const { data } = await api.post('/chat', { query: q, top_k: 10 })
+    const { data } = await api.post('/chat', { query: q, top_k: 10, mode: mode.value, history })
     const d = data.data
     messages.value.push({
       role: 'assistant',
@@ -182,6 +193,12 @@ async function scrollToBottom() {
 </script>
 
 <style scoped>
+.chat-mode-bar {
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
 .message-body {
   flex: 1;
   min-width: 0;

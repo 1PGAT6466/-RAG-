@@ -42,6 +42,10 @@ class SearchReq(BaseModel):
 class ChatReq(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(10, ge=1, le=50)
+    # 对话模式：auto(自动路由) / knowledge(仅RAG) / chat(自由对话) / web(联网)
+    mode: str = Field("auto")
+    # 多轮历史（可选）：[{role, content}, ...]，用于闲聊模式上下文
+    history: list[dict] = Field(default_factory=list)
 
 class CategoryReq(BaseModel):
     category: str = Field(..., min_length=1, max_length=64)
@@ -158,27 +162,87 @@ async def api_search(req: SearchReq, user=Depends(get_current_user)):
 
 @router.post("/api/chat")
 async def api_chat(req: ChatReq, user=Depends(get_current_user)):
-    # 1. 检索
+    from src.chat.router import classify_intent
+    from src.chat.engine import generate, generate_chat, build_citation_sources
+
+    # 确定本次对话的模式
+    mode = req.mode
+    if mode == "auto":
+        mode = classify_intent(req.query)
+
+    # 合法模式白名单
+    if mode not in ("knowledge", "chat", "web"):
+        mode = "knowledge"
+
+    # 闲聊模式：不检索，直接自由对话
+    if mode == "chat":
+        answer = await generate_chat(req.query, history=req.history)
+        return {
+            "status": "ok",
+            "data": {
+                "answer": answer,
+                "sources": [],
+                "mode": "chat",
+            }
+        }
+
+    # 联网模式：Tavily 搜索 + LLM 综合
+    if mode == "web":
+        from config import TAVILY_API_KEY
+        if not TAVILY_API_KEY:
+            # 未配置联网搜索：降级为闲聊，并明确告知用户
+            answer = await generate_chat(req.query, history=req.history)
+            hint = "（提示：当前未配置联网搜索，以下为基于模型知识的回答，非实时信息。）"
+            return {
+                "status": "ok",
+                "data": {
+                    "answer": hint + "\n\n" + answer,
+                    "sources": [],
+                    "mode": "chat",
+                }
+            }
+        # 联网搜索 + LLM 综合
+        from src.chat.engine import generate_web
+        from src.chat.web_search import web_search
+        web_results = await web_search(req.query, max_results=5)
+        if not web_results:
+            # 搜索失败/空：降级闲聊
+            answer = await generate_chat(req.query, history=req.history)
+            return {
+                "status": "ok",
+                "data": {
+                    "answer": "（联网搜索未能获取结果，以下为基于模型知识的回答。）\n\n" + answer,
+                    "sources": [],
+                    "mode": "chat",
+                }
+            }
+        answer, web_sources = await generate_web(req.query, web_results)
+        return {
+            "status": "ok",
+            "data": {
+                "answer": answer,
+                "sources": web_sources,
+                "mode": "web",
+            }
+        }
+
+    # knowledge 模式（默认）：检索 + 带引用生成
     results = await search(req.query, top_k=req.top_k)
-    # 检索无结果：快速返回，不浪费 LLM 调用（否则 LLM 会对着空上下文编造）
     if not results:
         return {
             "status": "ok",
             "data": {
                 "answer": "知识库中未检索到与您问题相关的内容，请尝试更换关键词或先上传相关文档。",
                 "sources": [],
+                "mode": "knowledge",
             }
         }
-    # 2. 生成（带引用标注）
     answer, refs = await generate(req.query, results)
-    # 3. 提取实际被引用的来源（精确锚点）
-    from src.chat.engine import build_citation_sources
     citations = build_citation_sources(refs, answer)
     return {
         "status": "ok",
         "data": {
             "answer": answer,
-            # 引用来源：编号 + 文档 + 精确位置（chunk_index）
             "sources": [
                 {
                     "ref": c["ref"],
@@ -189,7 +253,8 @@ async def api_chat(req: ChatReq, user=Depends(get_current_user)):
                     "content": c.get("content", "")[:200],
                 }
                 for c in citations
-            ]
+            ],
+            "mode": "knowledge",
         }
     }
 

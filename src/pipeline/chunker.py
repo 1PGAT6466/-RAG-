@@ -52,6 +52,13 @@ def chunk_text(text: str, source_name: str = "") -> list[dict]:
             idx += 1
 
     logger.info(f"分块完成: {len(chunks)} 个 chunk")
+
+    # 语言归一化：高置信度繁转简 + 非中文过滤（RAG_LANG_FILTER 控制）
+    from .language_filter import normalize_chunks
+    chunks = normalize_chunks(chunks)
+    if len(chunks) == 0:
+        logger.warning("语言归一化后无有效 chunk（可能全部为非中文内容）")
+
     return chunks
 
 

@@ -26,6 +26,16 @@ SYSTEM_PROMPT = """你是一个工业知识库助手。根据提供的文档内�
 4. 如果参考资料中没有相关信息，明确告知用户，不要强行引用
 5. 回答简洁、准确、结构化，引用标注紧跟在对应句末"""
 
+# 闲聊模式用的系统提示（自由对话，无强制引用约束）
+SYSTEM_PROMPT_CHAT = """你是一个友好、专业的工业知识库助手「伏羲」。
+
+现在处于自由对话模式，你可以进行日常聊天、答疑、头脑风暴，不强制引用文档。
+要求：
+1. 回答友好、自然、有温度
+2. 涉及工业/技术问题时给出专业、准确的解答
+3. 不编造事实；若不确定，坦诚说明
+4. 简洁有条理"""
+
 
 def _build_reference_context(chunks: list[dict]) -> tuple[str, list[dict]]:
     """把检索结果组装成「带编号」的参考资料（供 LLM 引用标注）
@@ -100,6 +110,92 @@ async def generate(query: str, context: list[dict]) -> tuple[str, list[dict]]:
         answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
 
     return answer, refs
+
+
+async def generate_chat(query: str, history: list[dict] = None) -> str:
+    """
+    自由对话（闲聊模式）：无检索上下文，直接调 LLM。
+    返回纯 answer 字符串（无引用）。
+    """
+    messages = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
+    # 可选多轮历史（最多带最近几轮，控制 token）
+    if history:
+        messages.extend(history[-6:])  # 最多带最近 3 轮（6 条）
+    messages.append({"role": "user", "content": query})
+
+    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
+        logger.error("LLM 未配置")
+        raise RuntimeError("LLM 服务未配置（缺失 API Key）")
+
+    try:
+        answer = await _call_mimo(messages)
+    except Exception as e:
+        logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
+        if not DEEPSEEK_API_KEY:
+            raise RuntimeError("LLM 调用失败：MiMo 不可用且未配置 DeepSeek") from e
+        try:
+            answer = await _call_deepseek(messages)
+        except Exception as e2:
+            logger.error(f"DeepSeek 也失败: {e2}")
+            raise RuntimeError("LLM 调用失败（MiMo + DeepSeek 均不可用）") from e2
+
+    if not answer or not answer.strip():
+        answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
+    return answer
+
+
+# 联网模式系统提示：要求基于搜索结果回答并标注来源
+SYSTEM_PROMPT_WEB = """你是一个工业知识库助手「伏羲」，现处于联网搜索模式。
+根据下方「搜索结果」回答用户问题。
+规则：
+1. 综合多个搜索结果，给出准确、全面的回答
+2. 关键结论后用 [编号] 标注对应结果（如 [1]、[2]）
+3. 若搜索结果不足以回答，诚实说明并给出建议
+4. 回答简洁、结构化"""
+
+
+async def generate_web(query: str, search_results: list[dict]) -> tuple[str, list[dict]]:
+    """
+    联网模式：搜索 + LLM 综合，返回 (answer, sources)。
+    sources 是 [{ref, title, url, content}]，供前端展示来源链接。
+    """
+    from .web_search import build_web_context
+    context_text = build_web_context(search_results)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_WEB},
+        {"role": "user", "content": f"搜索结果：\n\n{context_text}\n\n问题：{query}"}
+    ]
+
+    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
+        raise RuntimeError("LLM 服务未配置")
+
+    try:
+        answer = await _call_mimo(messages)
+    except Exception as e:
+        logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
+        if not DEEPSEEK_API_KEY:
+            raise RuntimeError("LLM 调用失败") from e
+        try:
+            answer = await _call_deepseek(messages)
+        except Exception as e2:
+            logger.error(f"DeepSeek 也失败: {e2}")
+            raise RuntimeError("LLM 调用失败") from e2
+
+    if not answer or not answer.strip():
+        answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
+
+    # 组装来源（带 ref 编号 + url）
+    sources = [
+        {
+            "ref": i + 1,
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "content": r.get("content", "")[:200],
+        }
+        for i, r in enumerate(search_results)
+    ]
+    return answer, sources
 
 
 def build_citation_sources(refs: list[dict], answer: str) -> list[dict]:

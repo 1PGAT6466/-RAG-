@@ -77,6 +77,9 @@ DEEPSEEK_MODEL = _env("DEEPSEEK_MODEL", "deepseek-v4-pro")
 DEEPSEEK_FLASH_MODEL = _env("DEEPSEEK_FLASH_MODEL", "deepseek-v4-flash")
 DEEPSEEK_TIMEOUT = int(_env("DEEPSEEK_TIMEOUT", "60"))
 
+# 联网搜索（Tavily，第二阶段接入）
+TAVILY_API_KEY = _env("TAVILY_API_KEY", "")
+
 # Embedding
 EMBEDDING_MODEL = _env("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 EMBEDDING_DEVICE = _env("EMBEDDING_DEVICE", "cpu")
@@ -123,6 +126,9 @@ RAG_AUTO_DOC_SIM = _env("RAG_AUTO_DOC_SIM", "1")  # 文档相似度边（similar
 # PDF OCR（乱码/扫描件自动转 OCR）
 RAG_PDF_OCR = _env("RAG_PDF_OCR", "auto")  # auto | force
 RAG_OCR_DML = _env("RAG_OCR_DML", "1")  # DirectML GPU 加速开关
+
+# 语言归一化：高置信度繁转简 + 非中文（日/韩/乱码）过滤
+RAG_LANG_FILTER = _env("RAG_LANG_FILTER", "1")
 
 # 流式入库（大 PDF 边解析边入库）
 RAG_STREAM_INGEST = _env("RAG_STREAM_INGEST", "1")
