@@ -1,0 +1,40 @@
+{
+  "name": "example-plugin",
+  "version": "1.0.0",
+  "api_version": "1",
+  "kind": "tool",
+  "display_name": "示例插件",
+  "description": "演示插件内核：echo、计算、崩溃隔离",
+  "author": "伏羲团队",
+  "entry": "main.py",
+  "tools": [
+    {
+      "name": "echo",
+      "description": "回显输入文本",
+      "parameters_schema": {
+        "type": "object",
+        "properties": { "text": { "type": "string" } },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "add",
+      "description": "两数相加",
+      "parameters_schema": {
+        "type": "object",
+        "properties": { "a": { "type": "number" }, "b": { "type": "number" } },
+        "required": ["a", "b"]
+      }
+    },
+    {
+      "name": "crash",
+      "description": "故意抛出异常（验证崩溃隔离）",
+      "parameters_schema": { "type": "object", "properties": {} }
+    },
+    {
+      "name": "hang",
+      "description": "故意死循环（验证超时隔离）",
+      "parameters_schema": { "type": "object", "properties": {} }
+    }
+  ]
+}

@@ -1,0 +1,248 @@
+"""
+ingest_stages.py — 引擎内置 Stage 实现
+
+把入库流水线拆成可独立降级的 Stage，注册进 engine。
+每个 Stage 接收 ctx（共享上下文），产出写入 ctx。
+
+同步 Stage（零 LLM，快速）：
+  parse      解析（pdfplumber 逐页进度）
+  chunk      分块
+  embed      向量化
+  store      入库（sqlite + FTS + ChromaDB）
+  classify   自动分类
+  extract    规则实体抽取 + 图谱 + 语义边（LLM 精分类异步补）
+
+异步 Stage（LLM 密集，后台执行）：
+  summarize  文档摘要
+  tag        主题标签
+  preindex   预设问题预索引
+"""
+import logging
+import os
+from config import UPLOAD_DIR, RAG_ENTITY_EXTRACT, RAG_ENTITY_LLM, RAG_AUTO_SUMMARY, RAG_AUTO_TAG, RAG_AUTO_PREINDEX
+
+from . import engine
+
+logger = logging.getLogger("rag.engine.stages")
+
+
+# ============================================================
+# 同步 Stage
+# ============================================================
+@engine.register_stage("parse", stage_type="sync")
+def _stage_parse(ctx: dict):
+    from .parser import parse_file
+    ext = ctx["ext"]
+    target = ctx["target_path"]
+    # 统一走 parse_file：内部对 PDF 做乱码/扫描件检测→OCR，与流式路径一致
+    text = parse_file(target)
+    if not text or len(text.strip()) < 50:
+        raise ValueError("文档无有效内容")
+    ctx["text"] = text
+
+
+@engine.register_stage("chunk", stage_type="sync")
+def _stage_chunk(ctx: dict):
+    from .chunker import chunk_text
+    chunks = chunk_text(ctx["text"], source_name=ctx["filename"])
+    if not chunks:
+        raise ValueError("分块后无有效内容")
+    ctx["chunks"] = chunks
+    ctx["chunk_count"] = len(chunks)
+
+
+@engine.register_stage("embed", stage_type="sync", critical=True)
+def _stage_embed(ctx: dict):
+    from .embedder import encode
+    chunks = ctx["chunks"]
+    contents = [c["content"] for c in chunks]
+    ctx["embeddings"] = encode(contents)
+    ctx["token_counts"] = [max(1, len(c) // 2) for c in contents]
+
+
+@engine.register_stage("store", stage_type="sync", critical=True)
+def _stage_store(ctx: dict):
+    from src.storage.db import add_file, add_chunks_batch, sync_chunk_count
+    chunks = ctx["chunks"]
+    file_id = add_file(
+        name=ctx["filename"], path=ctx["target_path"], ext=ctx["ext"],
+        size=os.path.getsize(ctx["target_path"])
+    )
+    batch = [
+        (file_id, c["index"], c["content"], ctx["token_counts"][i], ctx["embeddings"][i],
+         {"heading": c["heading"], "source": c["source"]})
+        for i, c in enumerate(chunks)
+    ]
+    chunk_ids = add_chunks_batch(batch)
+    sync_chunk_count(file_id)
+    ctx["file_id"] = file_id
+    ctx["chunk_ids"] = chunk_ids
+
+    # ChromaDB（失败不阻断）
+    try:
+        from src.storage.chroma_store import add_batch, _use_chroma
+        if _use_chroma():
+            add_batch([
+                (chunk_ids[i], ctx["embeddings"][i], chunks[i]["content"], file_id, i)
+                for i in range(len(chunk_ids))
+            ])
+    except Exception as e:
+        logger.warning(f"ChromaDB 写入失败（已忽略）: {e}")
+
+
+@engine.register_stage("classify", stage_type="sync")
+def _stage_classify(ctx: dict):
+    from .ingest import _auto_classify
+    from src.storage.db import update_file_category
+    cat = _auto_classify(ctx["filename"], ctx["text"])
+    if cat != "未分类":
+        update_file_category(ctx["file_id"], cat)
+    ctx["category"] = cat
+
+
+@engine.register_stage("extract", stage_type="sync")
+def _stage_extract(ctx: dict):
+    """规则实体抽取（零 LLM，快速），LLM 增强异步补"""
+    if RAG_ENTITY_EXTRACT != "1":
+        return
+    file_id = ctx["file_id"]
+    from src.extraction.relation_builder import process_file_rule
+    try:
+        process_file_rule(file_id)
+    except Exception as e:
+        logger.warning(f"规则实体抽取失败（已忽略）: {e}")
+        return
+    # LLM 精分类异步补（标准号低置信度）
+    if RAG_ENTITY_LLM == "1":
+        try:
+            from src.extraction.llm_worker import submit_file
+            submit_file(file_id)
+        except Exception as e:
+            logger.warning(f"LLM 实体增强提交失败（已忽略）: {e}")
+
+
+# ============================================================
+# 异步 Stage（LLM 密集，后台执行）
+# ============================================================
+def _llm_chat(text: str, system: str, max_tokens: int = 1024, prefer_deepseek: bool = False) -> str:
+    """同步 LLM 调用（供后台线程用）
+
+    prefer_deepseek=True 时优先 DeepSeek（非推理模型，结构化输出稳定），
+    因为 MiMo 是推理模型，reasoning_content 会抢占 max_tokens 导致 content 被截断。
+    """
+    import httpx
+    from config import MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, \
+        DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL, DEEPSEEK_TIMEOUT
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
+
+    providers = []
+    if prefer_deepseek:
+        # 结构化输出（摘要/标签/预索引）优先 flash（非推理、快、稳），回退 pro
+        providers.append(("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL))
+        providers.append(("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
+        providers.append(("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL))
+    else:
+        providers.append(("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL))
+        providers.append(("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
+
+    for name, base, key, model in providers:
+        # 每个 provider 试两次，应对 reasoning 模型偶发空返回
+        for attempt in range(2):
+            try:
+                with httpx.Client(timeout=120) as client:
+                    resp = client.post(
+                        f"{base}/chat/completions",
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2},
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"].get("content") or ""
+                    if content.strip():
+                        return content
+                    logger.warning(f"{name} 返回空 content（第{attempt+1}次），重试")
+            except Exception as e:
+                logger.warning(f"{name} 调用失败（第{attempt+1}次）: {e}")
+    return ""
+
+
+def _doc_head(ctx: dict, limit: int = 8000) -> str:
+    """取文档开头片段作为摘要/标签的输入（控制 token）"""
+    text = ctx.get("text", "")
+    return text[:limit]
+
+
+@engine.register_stage("summarize", stage_type="async")
+def _stage_summarize(ctx: dict):
+    if RAG_AUTO_SUMMARY != "1":
+        return
+    head = _doc_head(ctx)
+    summary = _llm_chat(
+        f"请用 3-5 句话概括以下工业文档的核心内容，突出涉及的标准、材料、工艺和关键参数：\n\n{head}",
+        "你是工业文档摘要助手，输出精炼摘要。",
+        max_tokens=1024,
+        prefer_deepseek=True,
+    )
+    ctx["summary"] = summary.strip()
+    # 回写文件元数据（若 db 支持 summary 字段则存，否则仅内存）
+    try:
+        from src.storage import db
+        if hasattr(db, "update_file_summary"):
+            db.update_file_summary(ctx["file_id"], summary.strip())
+    except Exception:
+        pass
+    logger.info(f"文件 {ctx.get('file_id')} 摘要生成完成")
+
+
+@engine.register_stage("tag", stage_type="async")
+def _stage_tag(ctx: dict):
+    if RAG_AUTO_TAG != "1":
+        return
+    head = _doc_head(ctx, 4000)
+    raw = _llm_chat(
+        f"从以下工业文档提炼 5-8 个主题标签，用 JSON 数组格式输出，不要输出其他内容：\n\n{head}",
+        "你是工业知识打标助手。只输出一个 JSON 字符串数组，例如 [连接器,镀金工艺,GB/T 699]。",
+        max_tokens=512,
+        prefer_deepseek=True,
+    )
+    import json
+    try:
+        start, end = raw.find("["), raw.rfind("]")
+        tags = json.loads(raw[start:end + 1]) if start != -1 and end != -1 else []
+        tags = [t for t in tags if isinstance(t, str)][:8]
+    except Exception:
+        tags = []
+    ctx["tags"] = tags
+    try:
+        from src.storage import db
+        if hasattr(db, "update_file_tags"):
+            db.update_file_tags(ctx["file_id"], tags)
+    except Exception:
+        pass
+    logger.info(f"文件 {ctx.get('file_id')} 标签生成完成: {tags}")
+
+
+@engine.register_stage("preindex", stage_type="async")
+def _stage_preindex(ctx: dict):
+    if RAG_AUTO_PREINDEX != "1":
+        return
+    head = _doc_head(ctx, 6000)
+    questions = [
+        "这份文档涉及哪些国家/行业标准？列举标准号及其用途",
+        "这份文档提到哪些材料？各自的性能特点和适用场景",
+        "这份文档涉及哪些关键工艺？流程要点是什么",
+        "这份文档有哪些关键参数指标",
+    ]
+    answers = {}
+    for q in questions:
+        try:
+            answers[q] = _llm_chat(
+                f"基于以下文档回答问题，简明扼要：\n\n文档：{head}\n\n问题：{q}",
+                "你是工业知识库助手，基于文档回答。",
+                max_tokens=512,
+                prefer_deepseek=True,
+            ).strip()
+        except Exception as e:
+            logger.warning(f"预索引问题失败: {e}")
+            answers[q] = ""
+    ctx["preindex"] = answers
+    logger.info(f"文件 {ctx.get('file_id')} 预索引完成（{len(answers)} 问）")

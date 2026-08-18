@@ -1,0 +1,20 @@
+{
+  "name": "hook-demo",
+  "version": "1.0.0",
+  "api_version": "1",
+  "kind": "workflow",
+  "display_name": "Hook 演示插件",
+  "description": "演示 Workflow hook：在检索结果返回前打标签/过滤",
+  "author": "伏羲团队",
+  "entry": "main.py",
+  "hooks": {
+    "on_search": {
+      "method": "on_search",
+      "description": "检索后处理：给结果追加来源标记"
+    },
+    "on_ingest": {
+      "method": "on_ingest",
+      "description": "入库后处理：记录入库日志"
+    }
+  }
+}
