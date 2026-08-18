@@ -606,3 +606,24 @@
 
 ### admin 账号密码
 - admin / admin123（本轮回归验证用，之前记忆未存，现已补）
+
+## 第十二轮：数据库锁修复 + 并发写事务 + 全局异常可读 + rerank 优化（2026-08-18）
+
+### 数据库锁根因（重要）
+- storage/db.py 的 _get_conn 只设了 WAL + foreign_keys，**漏了 busy_timeout**
+- 而 plugins/registry.py 的同类 _get_conn **已设 busy_timeout=5000**——「抄对了插件库，漏了主库」
+- 多线程并发写（uvicorn async + 引擎 worker 线程 + watcher 独立进程）时，主库遇写锁立即 database is locked（之前日志里出现过）
+
+### 修复
+1. db._get_conn 加 PRAGMA busy_timeout=5000（遇锁等待而非立即报错）
+2. add_chunks_batch 改显式事务 with conn:（批量提交，缩短写锁窗口；仍逐条取真实 rowid，因 executemany lastrowid 不可靠）
+3. server.py 全局异常处理器：数据库锁→「数据库忙请稍后重试」；LLM 未配置→明确提示；不再笼统「服务器内部错误」
+4. rerank.rerank_local：tokens 提前 lower 一次 + text.count(t) 合并 in 判断（消除循环内重复 lower/遍历）
+
+### 验证
+- 8线程×20次并发写 links = 160 次，零 database is locked（9.4s，busy_timeout 生效）
+- 检索/文档列表/实体图谱回归全通过
+
+### 教训
+- 同类模块（主库 db.py vs 插件库 registry.py）的 _get_conn 配置要统一，不能各写各的；插件库反而做了正确的 busy_timeout，说明当初是分别开发、未对齐
+- SQLite 并发写三件套：WAL + busy_timeout + 显式事务短窗口

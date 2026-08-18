@@ -307,7 +307,12 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
             return
         # 重新编号（全局连续）
         contents = [c["content"] for c in chunks]
-        embeddings = encode(contents)
+        # 向量化（带进度回调：大 batch 嵌入时逐批上报，避免长时间无反馈）
+        def _embed_progress(done, total_n):
+            _emit(task_id, "streaming",
+                  int(done_pages / total_pages * 90),
+                  f"向量化本批 {done}/{total_n} 块（已索引 {total_chunks} 块）")
+        embeddings = encode(contents, progress_cb=_embed_progress)
         token_counts = [max(1, len(c) // 2) for c in contents]
         rows = [
             (file_id, global_chunk_idx + j, chunks[j]["content"], token_counts[j],

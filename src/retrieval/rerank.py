@@ -105,11 +105,26 @@ async def rerank_with_deepseek(query, candidates, top_k=30):
                 data = resp.json()
                 raw = data["choices"][0]["message"]["content"]
                 raw = re.sub(r"```(?:json)?\s*|```", "", raw).strip()
-                scores_data = json.loads(raw)
+                # 提取 JSON：优先找 {..} 里的 scores 数组，防 LLM 前导说明文字
+                m = re.search(r'\{.*"scores"\s*:\s*\[.*?\].*\}', raw, re.DOTALL)
+                if not m:
+                    logger.warning(f"[Rerank DeepSeek] 输出无合法 scores JSON: {raw[:80]!r}")
+                    return []
+                try:
+                    scores_data = json.loads(m.group(0))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[Rerank DeepSeek] JSON 解析失败（降级）: {e}")
+                    return []
                 scores = scores_data.get("scores", [])
+                if not scores:
+                    logger.warning("[Rerank DeepSeek] scores 为空，降级")
+                    return []
                 scored = []
                 for i, r in enumerate(candidates[:len(scores)]):
-                    s = float(scores[i]) if i < len(scores) else 0.0
+                    try:
+                        s = float(scores[i])
+                    except (TypeError, ValueError):
+                        s = 0.0
                     rr = dict(r)
                     rr["_rerank_score"] = round(s, 4)
                     rr["_rerank_source"] = "deepseek"

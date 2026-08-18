@@ -88,7 +88,7 @@ def _has_weights(model_dir) -> bool:
     return False
 
 
-def _encode_local(texts: list[str]) -> list[bytes]:
+def _encode_local(texts: list[str], progress_cb=None) -> list[bytes]:
     """本地 sentence-transformers"""
     global _embedder, _LOCAL_MODEL_DIM, _LOCAL_UNAVAILABLE
     if _LOCAL_UNAVAILABLE:
@@ -101,11 +101,20 @@ def _encode_local(texts: list[str]) -> list[bytes]:
         _embedder = SentenceTransformer(path, device=EMBEDDING_DEVICE)
         _LOCAL_MODEL_DIM = _embedder.get_embedding_dimension()
         logger.info(f"本地模型就绪，维度={_LOCAL_MODEL_DIM}")
-    vecs = _embedder.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    return [_pack(v) for v in vecs]
+
+    # 大 batch 在 CPU 上会长时间阻塞无反馈，分批编码并回调进度
+    batch_size = 64
+    all_vecs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        vecs = _embedder.encode(batch, normalize_embeddings=True, show_progress_bar=False)
+        all_vecs.extend(_pack(v) for v in vecs)
+        if progress_cb and len(texts) > batch_size:
+            progress_cb(min(i + batch_size, len(texts)), len(texts))
+    return all_vecs
 
 
-def _encode_remote(texts: list[str]) -> list[bytes]:
+def _encode_remote(texts: list[str], progress_cb=None) -> list[bytes]:
     """SiliconFlow API（bge-large-zh-v1.5，1024 维）"""
     import httpx
     from config import SILICONFLOW_API_KEY
@@ -133,15 +142,18 @@ def _encode_remote(texts: list[str]) -> list[bytes]:
             data = resp.json()
             batch_embs = [np.array(d["embedding"], dtype=np.float32) for d in data["data"]]
             all_embeddings.extend(batch_embs)
-            if len(texts) > batch_size:
+            if progress_cb and len(texts) > batch_size:
+                progress_cb(min(i + batch_size, len(texts)), len(texts))
                 logger.info(f"远程向量化进度: {min(i + batch_size, len(texts))}/{len(texts)}")
     return [_pack(v) for v in all_embeddings]
 
 
-def encode(texts: list[str]) -> list[bytes]:
+def encode(texts: list[str], progress_cb=None) -> list[bytes]:
     """文本列表 → embedding bytes。
 
     混合策略：大 batch（> REMOTE_THRESHOLD）走远程 SiliconFlow，否则本地。
+    progress_cb(done, total)：可选进度回调，逐批上报（本地/远程均支持），
+    用于入库时向任务状态实时上报进度（大 PDF 向量化不再干等无反馈）。
     """
     global _LOCAL_UNAVAILABLE
     n = len(texts)
@@ -152,11 +164,11 @@ def encode(texts: list[str]) -> list[bytes]:
     if n > REMOTE_THRESHOLD:
         try:
             logger.info(f"文本数 {n} > 阈值 {REMOTE_THRESHOLD}，切换 SiliconFlow 远程向量化")
-            return _encode_remote(texts)
+            return _encode_remote(texts, progress_cb)
         except Exception as e:
             logger.warning(f"远程向量化失败，降级本地: {e}")
             try:
-                return _encode_local(texts)
+                return _encode_local(texts, progress_cb)
             except Exception:
                 pass
             raise
@@ -165,12 +177,12 @@ def encode(texts: list[str]) -> list[bytes]:
     p = _get_local_path()
     if p and not _LOCAL_UNAVAILABLE:
         try:
-            return _encode_local(texts)
+            return _encode_local(texts, progress_cb)
         except Exception as e:
             logger.warning(f"本地模型加载失败，降级远程 SiliconFlow: {e}")
             _LOCAL_UNAVAILABLE = True  # 缓存失败，后续直接远程
     try:
-        return _encode_remote(texts)
+        return _encode_remote(texts, progress_cb)
     except Exception as e:
         logger.error(f"Embedding 失败（本地+远程均不可用）: {e}")
         raise

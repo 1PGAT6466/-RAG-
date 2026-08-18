@@ -20,6 +20,9 @@
     <!-- 图谱画布 -->
     <div class="graph-container" ref="container">
       <svg ref="svgEl"></svg>
+      <div v-if="graphTruncated" class="graph-truncated-hint">
+        节点过多，已按关联度显示 Top {{ MAX_GRAPH_NODES }} 核心节点，可用上方筛选缩小范围
+      </div>
       <div v-if="loading" class="loading-center">
         <el-icon class="is-loading" style="font-size:32px"><Loading /></el-icon>
       </div>
@@ -136,6 +139,10 @@ const entityRelations = ref([])
 
 // 所有边（未筛选，供图例/筛选用）
 const allEdges = ref([])
+
+// 大图截断：节点数超过上限时按度取 Top 核心节点（避免 SVG 全量渲染卡死）
+const MAX_GRAPH_NODES = 300
+const graphTruncated = ref(false)
 
 let simulation = null
 
@@ -255,6 +262,8 @@ async function fetchGraph() {
         source: e.source_id ?? e.source,
         target: e.target_id ?? e.target,
       }))
+      // 大图截断：节点过多时按度取 Top 核心，避免 SVG 全量渲染卡顿
+      applyGraphTruncation()
       applyNodeFilter()
       applyEdgeFilter()
       buildEntityLegend()
@@ -336,6 +345,19 @@ function applyEdgeFilter() {
   const nodeIds = new Set(nodes.value.map(n => n.id))
   edges.value = edges.value.filter(e =>
     nodeIds.has(e.source_id ?? e.source) && nodeIds.has(e.target_id ?? e.target))
+}
+
+function applyGraphTruncation() {
+  // 大图截断：实体图节点数超上限时，按度取 Top 核心节点，避免 SVG 全量渲染卡死
+  graphTruncated.value = false
+  if (allNodes.value.length <= MAX_GRAPH_NODES) return
+  const sorted = [...allNodes.value].sort((a, b) => (b.degree || 0) - (a.degree || 0))
+  const keepIds = new Set(sorted.slice(0, MAX_GRAPH_NODES).map(n => n.id))
+  allNodes.value = sorted.slice(0, MAX_GRAPH_NODES)
+  // 边只保留两端节点都在保留集内的
+  allEdges.value = allEdges.value.filter(e =>
+    keepIds.has(e.source_id ?? e.source) && keepIds.has(e.target_id ?? e.target))
+  graphTruncated.value = true
 }
 
 function applyNodeFilter() {
@@ -503,6 +525,20 @@ function truncate(s, n) {
 .graph-container svg {
   width: 100%;
   height: 100%;
+}
+.graph-truncated-hint {
+  position: absolute;
+  left: 50%;
+  top: 16px;
+  transform: translateX(-50%);
+  background: rgba(250, 140, 22, 0.92);
+  color: #fff;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 16px;
+  z-index: 11;
+  pointer-events: none;
+  white-space: nowrap;
 }
 .loading-center {
   position: absolute;

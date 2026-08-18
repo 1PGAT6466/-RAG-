@@ -56,7 +56,14 @@ def _stage_embed(ctx: dict):
     from .embedder import encode
     chunks = ctx["chunks"]
     contents = [c["content"] for c in chunks]
-    ctx["embeddings"] = encode(contents)
+    total = len(contents)
+    # 用任务状态上报进度（大文档向量化不再干等无反馈）
+    def _on_progress(done, total_n):
+        emit = ctx.get("emit")
+        if emit:
+            pct = int(done / total_n * 100)
+            emit("embed", pct, f"向量化 {done}/{total_n} 块")
+    ctx["embeddings"] = encode(contents, progress_cb=_on_progress)
     ctx["token_counts"] = [max(1, len(c) // 2) for c in contents]
 
 
