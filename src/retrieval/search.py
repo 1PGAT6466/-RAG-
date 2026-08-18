@@ -4,7 +4,7 @@
 import logging
 import heapq
 from config import SEARCH_TOP_K, BM25_WEIGHT, VECTOR_WEIGHT, RAG_DYNAMIC_RANKING, RAG_RERANK
-from src.storage.db import fts_search, get_chunk
+from src.storage.db import fts_search
 from src.pipeline.embedder import encode_query, cosine_similarity
 
 logger = logging.getLogger("rag.retrieval")

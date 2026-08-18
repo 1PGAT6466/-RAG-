@@ -524,3 +524,31 @@
 ### 教训
 - 三个模块各写各的 keyword 表 = 分类标准分裂，检索加权时 query 判「品质管理」而文档标「测试报告」会悄悄失效
 - 「单一权威词典 + 常量文件」是消除分裂的正解；标准来源（IEC/DIN/ISO）是另一维度，不该混进内容领域
+
+## 第九轮：枚举/类型维度一致性 + 空功能检测（2026-08-18 用户「继续」）
+延续第八轮，扫除分类之外其它维度的隐性分裂和空功能。
+
+### 发现 1：标准领域 rel_type 命名残留（非 bug）
+- relation_builder 注释/result dict 一直提「standard_category 边」，但代码从未插入过这类边
+- 标准领域实际是实体属性 standard_domain（上轮已改），不是边；result 键名误导
+
+### 发现 2（核心）：两个「孤儿函数」从未接进入库链路
+- build_semantic_edges（compatible_process + 标准领域 + uses_standard）和 build_document_similarity_edges（similar）全项目只有定义、无调用
+- 后果：
+  - 新上传文件永不构建 compatible_process/标准领域/uses_standard 语义边（仅上轮手动跑过一次）
+  - links 表永远为空 → GraphView「文档引用图」是空图（只有节点无 similar 边）
+- 修复：新增异步 Stage semantic/docsim，入库后后台幂等构建；build_document_similarity_edges 支持 file_id 增量；新增 RAG_AUTO_SEMANTIC/RAG_AUTO_DOC_SIM flag
+- 验证：similar 边 0→6，文档引用图 4 节点 6 边
+
+### 发现 3：uses_standard=0 是正确行为，非 bug
+- _build_uses_standard_edges 用「严格同句共现」精筛，chunk 558 表格数据里「不锈钢」和「GB/T 5782」不同句（表格相邻），正确过滤掉虚假关联
+- 82 个同 chunk 候选对全部被逐句精筛过滤，印证「坑5 chunk级共现误导」的 v2 修复有效
+
+### 实体 type / 关系 rel_type 前后端一致性（确认无分裂）
+- 实体 type 5 类（connector/material/standard/process/param）前后端一致（TYPE_LABELS 对应）
+- 关系 rel_type 实际 4 类（cooccur/spec/compatible_process/uses_standard）+ links.similar，前端 REL_LABELS 对应
+- 边界：entity_relations 有 3 类（cooccur/spec/compatible_process），uses_standard 因数据无同句共现为 0，similar 在 links 表
+
+### 教训
+- 「函数写了但没接进调用链」是比「空接口」更隐蔽的空功能——代码 review 只看函数不追溯调用点就漏
+- 建完功能必须验证「数据真的产生」：links 表 0 条 = 文档引用图空图 = 功能假象

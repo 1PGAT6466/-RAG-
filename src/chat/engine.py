@@ -59,20 +59,6 @@ def _build_reference_context(chunks: list[dict]) -> tuple[str, list[dict]]:
     return "\n\n---\n\n".join(parts), refs
 
 
-def _build_context(chunks: list[dict]) -> str:
-    """向后兼容：无编号版本（保留给旧调用）"""
-    parts = []
-    seen = set()
-    for c in chunks:
-        content = c.get("content", "")
-        if content in seen:
-            continue
-        seen.add(content)
-        fname = c.get("file_name", "未知文档")
-        parts.append(f"【{fname}】\n{content}")
-    return "\n\n---\n\n".join(parts)
-
-
 async def generate(query: str, context: list[dict]) -> tuple[str, list[dict]]:
     """
     组装 prompt → 调用 LLM → 返回 (answer, refs)

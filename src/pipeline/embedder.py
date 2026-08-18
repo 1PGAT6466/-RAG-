@@ -180,16 +180,6 @@ def encode_query(text: str) -> bytes:
     return encode([text])[0]
 
 
-def get_embedding_dim() -> int:
-    """返回当前 embedding 维度（远程 large=1024，本地 small=512 / large=1024）"""
-    global _LOCAL_MODEL_DIM
-    if _LOCAL_MODEL_DIM is not None:
-        return _LOCAL_MODEL_DIM
-    # 本地模型未加载时的预设
-    from config import EMBEDDING_MODEL
-    return 1024 if "large" in EMBEDDING_MODEL else 512
-
-
 def _pack(vec: np.ndarray) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 

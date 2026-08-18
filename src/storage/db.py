@@ -308,23 +308,6 @@ def sync_chunk_count(file_id: int):
 
 # === Chunk 操作 ===
 
-def add_chunk(file_id: int, chunk_index: int, content: str,
-              token_count: int = 0, embedding: bytes = None,
-              metadata: dict = None) -> int:
-    conn = _get_conn()
-    cur = conn.execute(
-        "INSERT INTO chunks (file_id, chunk_index, content, token_count, embedding, metadata) "
-        "VALUES (?,?,?,?,?,?)",
-        (file_id, chunk_index, content, token_count, embedding, _dumps(metadata or {}))
-    )
-    # Sync FTS（jieba 分词后写入）
-    from src.storage.tokenizer import segment_for_fts
-    conn.execute("INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-                 (cur.lastrowid, segment_for_fts(content)))
-    conn.commit()
-    return cur.lastrowid
-
-
 def add_chunks_batch(rows: list[tuple]) -> list[int]:
     """批量插入 [(file_id, idx, content, token_count, embedding_bytes, metadata_dict), ...]
     返回 chunk 真实 id 列表"""
@@ -355,31 +338,6 @@ def get_chunks_by_file(file_id: int) -> list[dict]:
         "WHERE file_id=? ORDER BY chunk_index", (file_id,)
     ).fetchall()
     return [dict(r) for r in rows]
-
-
-def get_chunk(chunk_id: int) -> dict | None:
-    conn = _get_conn()
-    row = conn.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def get_chunk_embedding(chunk_id: int) -> bytes | None:
-    conn = _get_conn()
-    row = conn.execute("SELECT embedding FROM chunks WHERE id=?", (chunk_id,)).fetchone()
-    return row["embedding"] if row and row["embedding"] else None
-
-
-def update_chunk_embedding(chunk_id: int, embedding: bytes):
-    conn = _get_conn()
-    conn.execute("UPDATE chunks SET embedding=? WHERE id=?", (embedding, chunk_id))
-    conn.commit()
-
-
-def update_chunks_embedding_batch(updates: list[tuple[int, bytes]]):
-    """批量更新向量 [(chunk_id, embedding_bytes), ...]"""
-    conn = _get_conn()
-    conn.executemany("UPDATE chunks SET embedding=? WHERE id=?", updates)
-    conn.commit()
 
 
 # === FTS5 全文搜索 ===
@@ -417,27 +375,6 @@ def add_link(source_id: int, target_id: int, link_type: str = "keyword",
     )
     conn.commit()
     return cur.lastrowid
-
-
-def get_links(file_id: int = None) -> list[dict]:
-    conn = _get_conn()
-    if file_id:
-        rows = conn.execute(
-            "SELECT l.*, f1.name as source_name, f2.name as target_name "
-            "FROM links l "
-            "JOIN files f1 ON f1.id = l.source_id "
-            "JOIN files f2 ON f2.id = l.target_id "
-            "WHERE l.source_id=? OR l.target_id=?",
-            (file_id, file_id)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT l.*, f1.name as source_name, f2.name as target_name "
-            "FROM links l "
-            "JOIN files f1 ON f1.id = l.source_id "
-            "JOIN files f2 ON f2.id = l.target_id"
-        ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def get_graph_data() -> dict:

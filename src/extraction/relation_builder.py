@@ -12,30 +12,12 @@ relation_builder.py — 关系构建（阶段 2）
   - 失败可重跑、可降级（LLM 抽取失败 → 规则抽取）
 """
 import logging
-import asyncio
 import re
 
 from src.storage import db
 from src.extraction import entity_extractor
 
 logger = logging.getLogger("rag.extraction")
-
-
-async def extract_and_store(chunk_id: int, chunk_content: str, file_id: int,
-                            use_llm: bool = True) -> list[dict]:
-    """抽取单个 chunk 的实体并入库，返回该 chunk 抽取出的实体列表"""
-    entities = []
-    if use_llm:
-        try:
-            entities = await entity_extractor.extract_llm(chunk_content)
-        except Exception as e:
-            logger.warning(f"LLM 实体抽取失败，降级规则抽取: {e}")
-            entities = []
-    if not entities:
-        entities = entity_extractor.extract_rule(chunk_content)
-
-    stored = _store_entities_and_edges(entities, chunk_id, file_id)
-    return stored
 
 
 def _store_entities_and_edges(entities: list[dict], chunk_id: int, file_id: int) -> list[dict]:
@@ -69,23 +51,6 @@ def _build_cooccur_edges(entity_ids: list[int]) -> None:
     for i in range(n):
         for j in range(i + 1, n):
             db.add_entity_relation(entity_ids[i], entity_ids[j], rel_type="cooccur", weight=1.0)
-
-
-async def process_file(file_id: int, use_llm: bool = True) -> dict:
-    """处理一个文件的全部 chunk：抽取 + 入库 + 建关系
-
-    返回 {chunks_processed, entities_found}
-    """
-    chunks = db.get_chunks_by_file(file_id)
-    total_entities = 0
-    for c in chunks:
-        ents = await extract_and_store(c["id"], c["content"], file_id, use_llm=use_llm)
-        total_entities += len(ents)
-        if use_llm:
-            # 控制 LLM 调用频率，避免速率限制
-            await asyncio.sleep(0.1)
-    logger.info(f"文件 {file_id} 实体抽取完成: {len(chunks)} chunks, {total_entities} 实体")
-    return {"chunks_processed": len(chunks), "entities_found": total_entities}
 
 
 def process_file_rule(file_id: int) -> dict:

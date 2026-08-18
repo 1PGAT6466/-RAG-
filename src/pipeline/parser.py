@@ -123,32 +123,6 @@ def _extract_pdf_text(filepath: str) -> str:
     return "\n\n".join(texts)
 
 
-def _chinese_text_quality(text: str) -> float:
-    """中文可读率：可识别汉字占所有字符的比例，用于检测乱码
-
-    乱码特征：大量字符落在私用区（PUA）、控制符、或非 CJK 的怪字符。
-    正常中文 PDF 该值应 ≥ 0.9；乱码（CMap 损坏）时大量字映射成怪字符 → 值骤降。
-    """
-    if not text or not text.strip():
-        return 0.0
-    total = len(text)
-    if total < 50:
-        return 1.0  # 太短不判定
-    # 统计「正常可读」字符：CJK 汉字/中文标点/常用 ASCII
-    readable = 0
-    for ch in text:
-        o = ord(ch)
-        if (0x4E00 <= o <= 0x9FFF) or (0x3400 <= o <= 0x4DBF):  # 汉字
-            readable += 1
-        elif ch in '，。、；：？！（）《》〈〉【】“”‘’—…·％℃≤≥±×÷·■□▲△●○◆◇αβγσδλμωθ∞φπ':  # 中文标点/常用符号
-            readable += 1
-        elif ch.isspace():  # 空白不计入分母也不计入分子，但这里简化计入可读
-            readable += 1
-        elif 0x21 <= o <= 0x7E:  # 可打印 ASCII
-            readable += 1
-    return readable / total
-
-
 def _parse_pdf_ocr(filepath: str) -> str:
     """PDF OCR：用 PyMuPDF 渲染页面 → RapidOCR，逐页识别
 
@@ -344,30 +318,6 @@ def _parse_docx(filepath: str) -> str:
 def _parse_txt(filepath: str) -> str:
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
-
-
-def _parse_pdf_with_progress(filepath: str, task_id: str, set_status) -> str:
-    """
-    PDF 解析 — pdfplumber 全量解析，带进度回调
-    适配大文件（100MB+）：逐页解析，每 20 页更新一次进度
-    """
-    import pdfplumber
-    texts = []
-    with pdfplumber.open(filepath) as pdf:
-        total = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
-            t = page.extract_text()
-            if t:
-                texts.append(t)
-            # 每 20 页更新进度
-            if (i + 1) % 20 == 0 or (i + 1) == total:
-                pct = 5 + int(((i + 1) / total) * 60)  # 5%→65%
-                set_status(task_id, "parsing", pct, f"PDF 解析: {i + 1}/{total} 页")
-    return "\n\n".join(texts)
-
-
-def _fallback_convert(filepath: str) -> str:
-    return f"[文件: {Path(filepath).name}] 此格式暂不支持直接解析，请转换为 PDF 后上传。"
 
 
 def parse_pdf_streaming(filepath: str, on_batch, flush_pages: int = 20):

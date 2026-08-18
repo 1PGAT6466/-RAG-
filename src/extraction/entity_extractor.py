@@ -439,14 +439,6 @@ def extract_llm_sync(text: str) -> list[dict]:
     return _dedup(normalize_entities(entities))
 
 
-async def extract_llm(text: str) -> list[dict]:
-    """LLM 抽取：返回结构化实体列表，失败抛异常（由调用方降级到 rule）"""
-    import asyncio
-    content = await asyncio.to_thread(_llm_call_sync, text)
-    entities = _parse_json_array(content)
-    return _dedup(normalize_entities(entities))
-
-
 def _parse_json_array(content: str) -> list[dict]:
     """从 LLM 输出中稳健地提取 JSON 数组"""
     if not content:
