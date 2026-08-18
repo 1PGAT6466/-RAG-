@@ -9,7 +9,7 @@
       <div v-for="(msg, i) in messages" :key="i" class="message" :class="msg.role">
         <div class="message-avatar">{{ msg.role === 'user' ? 'U' : 'AI' }}</div>
         <div class="message-body">
-          <div class="message-content" v-html="renderAnswer(msg)"></div>
+          <div class="message-content" v-html="htmlFor(i)"></div>
 
           <!-- 引用卡片：知识点来源 + 精确位置锚点 -->
           <div v-if="msg.sources && msg.sources.length" class="message-sources">
@@ -56,7 +56,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, nextTick, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { Promotion } from '@element-plus/icons-vue'
 import { marked } from 'marked'
@@ -99,6 +99,20 @@ function renderAnswer(msg) {
     return `<sup class="cite-mark" data-ref="${num}" onclick="window.__jumpToSource('${num}')">[${num}]</sup>`
   })
   return html
+}
+
+// 预渲染 HTML 缓存（每条消息只解析一次，避免消息列表增长后每次渲染重算全部历史）
+const renderedHtml = computed(() => {
+  const map = new Map()
+  messages.value.forEach((msg, i) => {
+    map.set(i, renderAnswer(msg))
+  })
+  return map
+})
+
+// 按下标取缓存（供模板 v-html）
+function htmlFor(i) {
+  return renderedHtml.value.get(i) || ''
 }
 
 // 脚注点击：滚动到对应引用卡片

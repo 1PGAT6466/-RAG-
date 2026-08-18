@@ -38,6 +38,15 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True) -> lis
     # 3. 图谱召回（实体导航，第三个召回源）
     graph_results = _graph_recall(query, limit=30)
 
+    # 相关性看门：BM25 与图谱均零召回时，判定 query 与知识库词汇零重叠，返回空。
+    # 理由：向量检索对任意 query（含纯字母乱码）都会返回 top_k（bge-large 对 ASCII
+    # 字母串相似度可达 0.5+），无法独立判无；BM25/FTS 才是词汇级真实命中的可靠判据。
+    # 纯语义同义改写（如“怎么防锈”未命中“镀锌”）BM25 可能偏低，但此类依然能命中若干
+    # 实义词（“防锈”分词后有词），不会整句零命中；真正的无意义输入才会三者全空。
+    if not bm25_results and not graph_results:
+        logger.info(f"检索无词汇相关命中（bm25={len(bm25_results)}/graph={len(graph_results)}），返回空: query={query[:50]!r}")
+        return []
+
     # 4. 融合（动态 α 或原硬编码权重）
     if _use_dynamic_ranking():
         from src.retrieval.ranking import weighted_rrf_fusion, post_rank

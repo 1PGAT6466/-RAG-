@@ -75,11 +75,19 @@ async def generate(query: str, context: list[dict]) -> tuple[str, list[dict]]:
         {"role": "user", "content": f"参考资料：\n\n{context_text}\n\n问题：{query}"}
     ]
 
+    # 前置检查：两个 LLM 均未配置 key 时快速失败，给出明确提示（避免空 key 裸 401 后再降级）
+    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
+        logger.error("LLM 未配置：MIMO_API_KEY 与 DEEPSEEK_API_KEY 均为空")
+        raise RuntimeError("LLM 服务未配置（缺失 API Key），请联系管理员在 .env 中配置")
+
     # 优先 MiMo，失败切 DeepSeek；两者均失败时抛统一错误（交给全局异常处理器）
     try:
         answer = await _call_mimo(messages)
     except Exception as e:
         logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
+        if not DEEPSEEK_API_KEY:
+            logger.error("MiMo 失败且 DeepSeek 未配置，无法降级")
+            raise RuntimeError("LLM 调用失败：MiMo 不可用且未配置 DeepSeek 作为备用") from e
         try:
             answer = await _call_deepseek(messages)
         except Exception as e2:

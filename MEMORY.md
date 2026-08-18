@@ -552,3 +552,33 @@
 ### 教训
 - 「函数写了但没接进调用链」是比「空接口」更隐蔽的空功能——代码 review 只看函数不追溯调用点就漏
 - 建完功能必须验证「数据真的产生」：links 表 0 条 = 文档引用图空图 = 功能假象
+
+## 第十轮：全量「函数→调用点」追溯审计 + 死代码清理（2026-08-18 用户「需要」）
+延续第九轮，建立完整清单彻底根除隐性空功能/孤儿函数。
+
+### 方法
+- AST 自动扫描 src 全部 .py 的顶层函数/类定义（约 200 个）
+- 收集全部 Call 名，交叉追溯「定义了但零同名调用」的孤儿
+- 人工甄别假阳性：装饰器注册的 stage（register_stage 用 fn 变量）、API handler（router 装饰器）、async worker（threading.Thread target）、parsers dict dispatch
+
+### 确凿死代码清单（已删 18 处）
+1. relation_builder: extract_and_store(async) + process_file(async) —— 旧实现，主链路用 process_file_rule
+2. entity_extractor: extract_llm(async) —— 只被死代码调，实际用 extract_llm_sync
+3. chat/engine: _build_context —— 无编号旧版
+4. db: add_chunk/get_chunk/get_chunk_embedding/update_chunk_embedding/update_chunks_embedding_batch/get_links —— 六处孤儿
+5. embedder: get_embedding_dim —— 实际用 SentenceTransformer.get_embedding_dimension（复数）
+6. parser: _chinese_text_quality（字符级乱码检测，已被 jieba 多字词命中率法取代）/ _fallback_convert / _parse_pdf_with_progress
+7. search.py: 未使用的 get_chunk import
+
+### 保留（有真实依赖，不可误删）
+- chroma_store.reset/count（scripts/migrate_stage1.py 用）
+- chroma_store.ensure_synced（server.py 启动时向量库同步）
+- engine.list_tasks（任务查询预留）
+- _parse_pptx/ppt/xlsx/docx/txt（parsers dict dispatch）
+- 插件生命周期 get_enabled_tools/is_enabled/alive/stop_all（server.py 用 stop_all）
+
+### 关键教训
+- 装饰器/线程/事件驱动会让 AST 静态分析产生假阳性，必须结合「谁真正调用 + 是否产生数据」人工甄别
+- 「函数被淘汰但没删」是死代码主要来源：_chinese_text_quality 就是被 jieba 多字词法替代后的残留
+- 删除前必须验证：①零 AST 引用 ②不在 scripts/ 被引用 ③无同名相似函数混淆（get_embedding_dim vs get_embedding_dimension）
+- 结果：8 文件 -181 行净减，全链路回归 200

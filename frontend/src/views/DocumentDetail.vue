@@ -1,6 +1,11 @@
 <template>
   <div style="height:100%;overflow-y:auto;padding:24px">
-    <div v-if="!file" class="loading-center"><el-icon class="is-loading" style="font-size:32px"><Loading /></el-icon></div>
+    <div v-if="loadError" class="empty-state">
+      <el-icon style="font-size:48px"><CircleClose /></el-icon>
+      <p>{{ loadError }}</p>
+      <el-button size="small" type="primary" @click="loadFile">重试</el-button>
+    </div>
+    <div v-else-if="!file" class="loading-center"><el-icon class="is-loading" style="font-size:32px"><Loading /></el-icon></div>
     <template v-else>
       <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
         <span style="font-size:28px">{{ iconFor(file.ext) }}</span>
@@ -37,7 +42,7 @@
 <script setup>
 import { ref, nextTick, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Loading } from '@element-plus/icons-vue'
+import { Loading, CircleClose } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
@@ -48,6 +53,7 @@ const auth = useAuthStore()
 const file = ref(null)
 const chunks = ref([])
 const highlightChunk = ref(null)
+const loadError = ref('')
 const chunkEls = {}
 
 function setChunkRef(idx, el) {
@@ -109,7 +115,10 @@ async function onAction(cmd) {
   }
 }
 
-onMounted(async () => {
+async function loadFile() {
+  loadError.value = ''
+  file.value = null
+  chunks.value = []
   try {
     const { data } = await api.get(`/documents/${route.params.id}`)
     file.value = data.data.file
@@ -127,8 +136,11 @@ onMounted(async () => {
     }
   } catch (e) {
     console.error('加载文档失败', e)
+    loadError.value = '文档加载失败：' + (e.response?.data?.detail || e.message || '网络错误')
   }
-})
+}
+
+onMounted(loadFile)
 </script>
 
 <style scoped>

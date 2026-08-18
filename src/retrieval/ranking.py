@@ -98,8 +98,12 @@ def _query_terms(q_lower: str) -> list[str]:
 
 def exact_match_boost(query: str, results: list) -> list:
     """精确匹配 + 型号/编号加权"""
+    if not results:
+        return results
     q_lower = query.lower()
     exact_models = detect_exact_models(query)
+    # 关键词只切一次（原实现每个 chunk 重复 jieba 分词 query，N 次冗余）
+    q_terms = _query_terms(q_lower)
 
     for r in results:
         text = (r.get("content") or r.get("text") or "").lower()
@@ -110,7 +114,6 @@ def exact_match_boost(query: str, results: list) -> list:
         if q_lower in text:
             boost += 5
         # 关键词命中（中文无空格，使用 jieba 分词；英文回退空格拆分）
-        q_terms = _query_terms(q_lower)
         hit = sum(1 for t in q_terms if t in text)
         boost += min(hit, 5)
         # 文件名命中

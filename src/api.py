@@ -160,6 +160,15 @@ async def api_search(req: SearchReq, user=Depends(get_current_user)):
 async def api_chat(req: ChatReq, user=Depends(get_current_user)):
     # 1. 检索
     results = await search(req.query, top_k=req.top_k)
+    # 检索无结果：快速返回，不浪费 LLM 调用（否则 LLM 会对着空上下文编造）
+    if not results:
+        return {
+            "status": "ok",
+            "data": {
+                "answer": "知识库中未检索到与您问题相关的内容，请尝试更换关键词或先上传相关文档。",
+                "sources": [],
+            }
+        }
     # 2. 生成（带引用标注）
     answer, refs = await generate(req.query, results)
     # 3. 提取实际被引用的来源（精确锚点）

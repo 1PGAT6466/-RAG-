@@ -79,7 +79,12 @@ def add_batch(rows: list[tuple]) -> None:
 
 
 def search(query_embedding: bytes, top_k: int = 30) -> list[dict]:
-    """按 query 向量检索，返回 [{id, content, file_id, score, ...}]"""
+    """按 query 向量检索，返回 [{id, content, file_id, score, ...}]
+
+    注：不在此处按相似度阈值过滤——实测 bge-large 对英文/字母串（如纯乱码
+    'zzzzqqqq'）也会给出 0.5+ 的余弦相似度，与真实中文查询（0.54~0.69）重叠，
+    阈值无法可靠区分。真正的相关性判据交给 BM25/FTS 关键词命中（见 search.py）。
+    """
     col = _get_collection()
     qvec = _unpack(query_embedding).tolist()
     res = col.query(
