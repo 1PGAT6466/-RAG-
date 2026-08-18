@@ -7,7 +7,7 @@
       <div class="category-tree">
         <div class="category-item"
           :class="{ active: activeCategory === '' }"
-          @click="activeCategory = ''">
+          @click="selectCategory('')">
           <el-icon><Folder /></el-icon> 全部
           <span class="category-count">{{ files.length }}</span>
         </div>
@@ -15,7 +15,7 @@
           v-for="cat in categories"
           :key="cat.name"
           :class="{ active: activeCategory === cat.name }"
-          @click="activeCategory = cat.name">
+          @click="selectCategory(cat.name)">
           <el-icon><Folder /></el-icon> {{ cat.name }}
           <span class="category-count">{{ cat.count }}</span>
         </div>
@@ -149,9 +149,12 @@ const filterMaterial = ref('')
 const filterDate = ref('')
 const viewMode = ref('card')
 
+// allFiles：全量（供分类树 + 型号/材料下拉选项）；files：筛选后列表
+const allFiles = ref([])
+
 const categories = computed(() => {
   const map = {}
-  files.value.forEach(f => {
+  allFiles.value.forEach(f => {
     const cat = f.category || '未分类'
     map[cat] = (map[cat] || 0) + 1
   })
@@ -160,42 +163,42 @@ const categories = computed(() => {
 
 const filteredFiles = computed(() => {
   let list = files.value
-  if (activeCategory.value) list = list.filter(f => (f.category || '未分类') === activeCategory.value)
+  // 仅本地文本搜索（后端无 name 搜索，且为即时输入过滤场景）
   if (searchText.value) {
     const s = searchText.value.toLowerCase()
     list = list.filter(f => f.name.toLowerCase().includes(s))
   }
-  if (filterModel.value) list = list.filter(f => (f.models || []).includes(filterModel.value))
-  if (filterMaterial.value) list = list.filter(f => (f.materials || []).includes(filterMaterial.value))
-  if (filterDate.value) {
-    const days = parseInt(filterDate.value)
-    const cutoff = Date.now() - days * 24 * 3600 * 1000
-    list = list.filter(f => {
-      const t = f.updated_at || f.created_at
-      if (!t) return false
-      return new Date(t) >= cutoff
-    })
-  }
   return list
 })
 
-// 所有可筛的型号/材料（去重，来自当前文件列表）
+// 所有可筛的型号/材料（去重，来自全量文件列表，仅用于下拉选项展示）
 const allModels = computed(() => {
   const s = new Set()
-  files.value.forEach(f => (f.models || []).forEach(m => s.add(m)))
+  allFiles.value.forEach(f => (f.models || []).forEach(m => s.add(m)))
   return Array.from(s).sort()
 })
 const allMaterials = computed(() => {
   const s = new Set()
-  files.value.forEach(f => (f.materials || []).forEach(m => s.add(m)))
+  allFiles.value.forEach(f => (f.materials || []).forEach(m => s.add(m)))
   return Array.from(s).sort()
 })
 
-function onFilterChange() {}
+// 筛选变化 → 重新请求后端（带 category/model/material/date 参数），统一筛选逻辑
+function onFilterChange() {
+  fetchFiles()
+}
+
+function selectCategory(name) {
+  activeCategory.value = name
+  fetchFiles()
+}
+
 function clearFilter() {
   filterModel.value = ''
   filterMaterial.value = ''
   filterDate.value = ''
+  activeCategory.value = ''
+  fetchFiles()
 }
 
 function formatDate(ts) {
@@ -226,9 +229,23 @@ function formatSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(1) + ' MB'
 }
 
-async function fetchFiles() {
+async function fetchAllFiles() {
   try {
     const { data } = await api.get('/documents')
+    allFiles.value = data.data || []
+  } catch (e) {
+    // 全量选项加载失败不阻断列表（列表 fetchFiles 会单独报错）
+  }
+}
+
+async function fetchFiles() {
+  try {
+    const params = {}
+    if (activeCategory.value) params.category = activeCategory.value
+    if (filterModel.value) params.model = filterModel.value
+    if (filterMaterial.value) params.material = filterMaterial.value
+    if (filterDate.value) params.date = filterDate.value
+    const { data } = await api.get('/documents', { params })
     files.value = data.data || []
   } catch (e) {
     ElMessage.error('加载文档列表失败')
@@ -284,6 +301,7 @@ async function pollProgress(taskId, filename) {
         uploading.value = false
         uploadProgress.value = ''
         await fetchFiles()
+        await fetchAllFiles()
         return
       }
       if (s.status === 'failed') {
@@ -305,5 +323,8 @@ async function pollProgress(taskId, filename) {
   ElMessage.warning(`${filename} 处理超时，请刷新页面查看`)
 }
 
-onMounted(fetchFiles)
+onMounted(() => {
+  fetchAllFiles()
+  fetchFiles()
+})
 </script>

@@ -169,26 +169,44 @@ def get_file(file_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def list_files(category: str = None) -> list[dict]:
+def list_files(category: str = None, date: str = None) -> list[dict]:
     conn = _get_conn()
+    # 日期筛选（近 N 天），date 形如 "7d"/"30d"/"90d"
+    date_cond = ""
+    date_args = []
+    if date:
+        try:
+            days = int(str(date).rstrip("d"))
+            date_cond = " WHERE updated_at >= datetime('now','localtime', ?)"
+            date_args = [f"-{days} days"]
+        except ValueError:
+            pass
     if category:
-        rows = conn.execute(
-            "SELECT * FROM files WHERE category=? ORDER BY updated_at DESC", (category,)
-        ).fetchall()
+        if date_cond:
+            rows = conn.execute(
+                f"SELECT * FROM files{date_cond} AND category=? ORDER BY updated_at DESC",
+                tuple(date_args + [category]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM files WHERE category=? ORDER BY updated_at DESC", (category,)
+            ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM files ORDER BY updated_at DESC").fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM files{date_cond} ORDER BY updated_at DESC", tuple(date_args)
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
-def list_files_with_entities(category: str = None, model: str = None, material: str = None) -> list[dict]:
-    """文件列表 + 每个文件关联的实体（型号/材料），支持按型号/材料筛选（阶段 3 字段筛选）
+def list_files_with_entities(category: str = None, model: str = None, material: str = None, date: str = None) -> list[dict]:
+    """文件列表 + 每个文件关联的实体（型号/材料），支持按型号/材料/日期筛选（阶段 3 字段筛选）
 
     返回 list_files 的结果，每个文件额外带：
       - models: list[str]   连接器型号实体（type=connector）
       - materials: list[str] 材料实体（type=material）
     """
     conn = _get_conn()
-    files = list_files(category=category)
+    files = list_files(category=category, date=date)
     if not files:
         return []
     file_ids = [f["id"] for f in files]

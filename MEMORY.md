@@ -470,3 +470,27 @@
 
 ### 服务日志噪音（无害）
 - chromadb 0.6.3 telemetry 每次报 "capture() takes 1 positional argument but 3 were given"（posthog 版本不兼容 bug），无害但扰人，可设 ANONYMIZED_TELEMETRY=False 静默
+
+## 第七轮：功能完善度 / 前后端对齐检测（2026-08-18）
+用户要求：检测功能完善度，确保后端功能跟前端对齐，无「空按钮」「空接口」。
+
+### 检测方法（三向对照）
+- 后端每个 endpoint → handler 是否真实现（非 pass/硬编码空返回/TODO）
+- 前端每个按钮/事件 → 是否真调用后端（非空回调/console.log 占位）
+- 后端返回字段 → 前端是否真渲染（非"返回了但前端当空气"）
+
+### 诊断结论（真实问题 2 个）
+1. **型号/材料筛选：后端空接口**——后端 list_files_with_entities 已实现 model/material 参数，但前端 DocumentsView 用本地 computed 过滤，没消费后端参数；且 onFilterChange 是空函数（死代码）
+2. **日期筛选：假功能**——前端 filterDate 纯本地过滤，后端根本没 date 参数/字段查询，files 表虽有 created_at/updated_at 但 list_files 不支持
+
+### 修复（对齐「统一」原则，消灭前后端重复过滤逻辑）
+- 后端：list_files + list_files_with_entities + /api/documents 新增 date 参数（近 N 天，SQL datetime('now','localtime',?) 相对日期）
+- 前端 DocumentsView：筛选改为走后端（category/model/material/date 参数），删空 onFilterChange 和本地过滤 computed
+- 数据源拆分（用户确认方案）：allFiles（全量，供分类树+型号/材料下拉选项，fetchAllFiles 单独拉）+ files（筛选后列表，fetchFiles 带参拉）
+- 验证：date=7d→4份、category=连接器→0份（正确无此分类）、model=MLG12→1份（精确命中）；npm build 通过
+
+### 其余功能点全部真实现（无空按钮/空接口）
+- ChatView：send→/chat→answer+引用脚注跳转全真实现；XSS 已过 DOMPurify
+- GraphView：双图谱 d3 渲染 + /graph + /entities/graph + /entities/{id} 反链全真实现
+- DocumentDetail：删除/改分类/改标签（ElMessageBox+api+错误处理）全真实现
+- PluginsView：启停/卸载/调用 + SchemaForm 声明式渲染 + SchemaResult 全真实现

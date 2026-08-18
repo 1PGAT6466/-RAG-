@@ -117,9 +117,9 @@ async def api_upload_progress(task_id: str, user=Depends(get_current_user)):
     return {"status": "ok", "data": status}
 
 @router.get("/api/documents")
-async def api_list_files(category: str = None, model: str = None, material: str = None, user=Depends(get_current_user)):
+async def api_list_files(category: str = None, model: str = None, material: str = None, date: str = None, user=Depends(get_current_user)):
     from src.storage.db import list_files_with_entities
-    files = list_files_with_entities(category=category, model=model, material=material)
+    files = list_files_with_entities(category=category, model=model, material=material, date=date)
     return {"status": "ok", "data": files}
 
 @router.get("/api/documents/{file_id}")
