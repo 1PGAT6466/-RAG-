@@ -232,10 +232,16 @@ def build_semantic_edges() -> dict:
                 need_llm.append(name)
         if cat:
             conn.execute(
-                "UPDATE entities SET attributes = json_set(COALESCE(attributes,'{}'), '$.category', ?) WHERE id=?",
+                "UPDATE entities SET attributes = json_set(COALESCE(attributes,'{}'), '$.standard_domain', ?) WHERE id=?",
                 (cat, s["id"]),
             )
             result["standard_category"] += 1
+        else:
+            # 未命中前缀规则 → 归「其他」（保证每个标准实体都有标准字段）
+            conn.execute(
+                "UPDATE entities SET attributes = json_set(COALESCE(attributes,'{}'), '$.standard_domain', '其他') WHERE id=?",
+                (s["id"],),
+            )
     conn.commit()
 
     # LLM 批量精分类（低置信度号段，写缓存 + 更新 attributes）
@@ -244,7 +250,7 @@ def build_semantic_edges() -> dict:
         for name, cat in llm_result.items():
             db.set_standard_category(name, cat, source="llm")
             conn.execute(
-                "UPDATE entities SET attributes = json_set(COALESCE(attributes,'{}'), '$.category', ?) WHERE name=? AND type='standard'",
+                "UPDATE entities SET attributes = json_set(COALESCE(attributes,'{}'), '$.standard_domain', ?) WHERE name=? AND type='standard'",
                 (cat, name),
             )
         conn.commit()

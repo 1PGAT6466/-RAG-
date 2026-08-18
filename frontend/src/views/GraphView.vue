@@ -148,18 +148,19 @@ const TYPE_COLORS = {
   param: '#eb2f96',       // 粉
   unknown: '#8c8c8c',
 }
-// 标准号按 category 细分着色（standard 节点的 attributes.category）
+// 标准号按 standard_domain 细分着色（standard 节点的 attributes.standard_domain）
+// 领域词表与后端 STANDARD_DOMAINS 严格一致
 const STD_CATEGORY_COLORS = {
-  紧固件: '#fa8c16',      // 橙
-  材料: '#f5222d',        // 红
-  机械制图: '#13c2c2',    // 青
-  工艺: '#722ed1',        // 紫
-  轴承: '#a0d911',        // 黄绿
-  密封件: '#2f54eb',      // 深蓝
-  公差配合: '#faad14',    // 金黄
-  电工: '#eb2f96',        // 粉
-  国际标准: '#52c41a',    // 绿
-  德国标准: '#8c8c8c',    // 灰
+  '材料': '#f5222d',        // 红
+  '紧固件': '#faad14',      // 金黄
+  '工艺': '#722ed1',        // 紫
+  '机械制图': '#13c2c2',    // 青
+  '电工': '#eb2f96',        // 粉
+  '轴承': '#a0d911',        // 黄绿
+  '密封件': '#2f54eb',      // 深蓝
+  '公差配合': '#fa8c16',    // 橙
+  '基础标准': '#8c8c8c',    // 灰
+  '其他': '#bfbfbf',        // 浅灰
 }
 const TYPE_LABELS = {
   connector: '连接器',
@@ -195,7 +196,7 @@ function relLabel(t) { return REL_LABELS[t] || t }
 function typeColor(t) { return TYPE_COLORS[t] || TYPE_COLORS.unknown }
 function typeLabel(t) { return TYPE_LABELS[t] || t }
 
-// 读取 standard 节点的 category（从 attributes JSON 里解）
+// 读取 standard 节点的标准号领域（从 attributes JSON 里解 standard_domain）
 function nodeCategory(n) {
   if (!n || n.type !== 'standard') return null
   if (!n.attributes) return null
@@ -203,7 +204,7 @@ function nodeCategory(n) {
   if (typeof a === 'string') {
     try { a = JSON.parse(a) } catch { return null }
   }
-  return a.category || null
+  return a.standard_domain || null
 }
 
 // 节点实际颜色：standard 按 category 细分，其他按 type

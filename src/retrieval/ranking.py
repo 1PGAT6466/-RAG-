@@ -7,6 +7,8 @@ ranking.py — 动态融合权重 + 精确型号匹配（移植自 RAG伏羲 dyn
 import re
 import logging
 
+from src.classification import CATEGORY_DICT
+
 logger = logging.getLogger("rag.ranking")
 
 
@@ -54,16 +56,8 @@ _MODEL_PATTERNS = [
     r"\bpom\b", r"\bpa66\b", r"\bpa6\b", r"\babs\b", r"\bpp\b", r"\blcp\b",  # 材料型号
 ]
 
-# 分类关键词表（工业领域）
-_CATEGORY_KW = {
-    "连接器": ["连接器", "connector", "fakra", "端子", "接插件", "板端", "线端", "弯式", "直式"],
-    "机械设计": ["齿轮", "轴承", "蜗杆", "蜗轮", "花键", "联轴器", "公差", "配合", "凸轮", "设计手册"],
-    "材料选型": ["材料", "选型", "材质", "金属", "塑料", "lcp", "铜材", "镀层", "电镀"],
-    "工艺规程": ["工艺", "工序", "装配", "检测", "产线", "sop", "注塑", "焊锡", "组装"],
-    "标准件": ["标准件", "标准", "规格", "gb/t", "iso", "din"],
-    "品质管理": ["三坐标", "grr", "cpk", "spc", "位置度", "圆度", "检具", "测试", "报告"],
-    "电气自动化": ["plc", "伺服", "变频器", "传感器", "接线", "hmi", "阻抗", "高频", "屏蔽"],
-}
+# 分类关键词表（工业题材，统一走 src.classification.CATEGORY_DICT 权威词典）
+_CATEGORY_KW = CATEGORY_DICT
 
 
 def detect_exact_models(query: str) -> list:
