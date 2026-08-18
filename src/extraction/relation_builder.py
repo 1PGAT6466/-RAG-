@@ -323,35 +323,59 @@ def _build_uses_standard_edges() -> int:
     return count
 
 
-def build_document_similarity_edges(top_k: int = 5, threshold: float = 0.7) -> int:
-    """文档相似度建边：基于文件向量相似度（可选，阶段 2 增强）
+def build_document_similarity_edges(top_k: int = 5, threshold: float = 0.7, file_id: int = None) -> int:
+    """文档相似度建边：基于文件向量相似度（阶段 2 增强）
 
-    返回新建边数量
+    file_id 提供时：仅计算该文件与其余文件的相似度（增量，适用于入库后），
+    避免每次全量 O(n²) 重算。file_id 为 None 时全量两两计算（首次/重建）。
+
+    返回新建边数量。
     """
-    # 用文件下所有 chunk 的平均向量代表文件向量，计算两两余弦相似度
     conn = db._get_conn()
     files = conn.execute("SELECT id FROM files").fetchall()
-    file_vectors = {}
-    for f in files:
+    if not files:
+        return 0
+    import numpy as np
+
+    def _file_vector(fid):
         rows = conn.execute(
-            "SELECT embedding FROM chunks WHERE file_id=? AND embedding IS NOT NULL", (f["id"],)
+            "SELECT embedding FROM chunks WHERE file_id=? AND embedding IS NOT NULL", (fid,)
         ).fetchall()
         if not rows:
-            continue
-        import numpy as np
+            return None
         from src.pipeline.embedder import _unpack
         vecs = [_unpack(r["embedding"]) for r in rows]
-        file_vectors[f["id"]] = np.mean(vecs, axis=0)
+        return np.mean(vecs, axis=0)
 
-    # 两两相似度
     count = 0
-    ids = list(file_vectors.keys())
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            a = file_vectors[ids[i]]
-            b = file_vectors[ids[j]]
+    all_ids = [f["id"] for f in files]
+    if file_id is not None and file_id in all_ids:
+        # 增量：新文件 vs 其余已有文件
+        target_ids = [file_id]
+        other_ids = [i for i in all_ids if i != file_id]
+    else:
+        target_ids = all_ids
+        other_ids = all_ids
+
+    # 预先卸载向量，避免重复计算
+    vec_cache = {}
+    def _v(fid):
+        if fid not in vec_cache:
+            vec_cache[fid] = _file_vector(fid)
+        return vec_cache[fid]
+
+    for i in target_ids:
+        a = _v(i)
+        if a is None:
+            continue
+        for j in other_ids:
+            if j <= i:
+                continue
+            b = _v(j)
+            if b is None:
+                continue
             sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
             if sim >= threshold:
-                db.add_link(ids[i], ids[j], link_type="similar", weight=sim, context=f"similarity={sim:.3f}")
+                db.add_link(i, j, link_type="similar", weight=sim, context=f"similarity={sim:.3f}")
                 count += 1
     return count

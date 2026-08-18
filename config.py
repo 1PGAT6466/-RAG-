@@ -107,6 +107,8 @@ RAG_ENTITY_LLM_MAX_CHUNKS = _env("RAG_ENTITY_LLM_MAX_CHUNKS", "50")  # 单文件
 RAG_AUTO_SUMMARY = _env("RAG_AUTO_SUMMARY", "1")
 RAG_AUTO_TAG = _env("RAG_AUTO_TAG", "1")
 RAG_AUTO_PREINDEX = _env("RAG_AUTO_PREINDEX", "1")
+RAG_AUTO_SEMANTIC = _env("RAG_AUTO_SEMANTIC", "1")  # 语义边（compatible_process/标准字段/uses_standard）
+RAG_AUTO_DOC_SIM = _env("RAG_AUTO_DOC_SIM", "1")  # 文档相似度边（similar）
 
 # PDF OCR（乱码/扫描件自动转 OCR）
 RAG_PDF_OCR = _env("RAG_PDF_OCR", "auto")  # auto | force

@@ -19,7 +19,7 @@ ingest_stages.py — 引擎内置 Stage 实现
 """
 import logging
 import os
-from config import UPLOAD_DIR, RAG_ENTITY_EXTRACT, RAG_ENTITY_LLM, RAG_AUTO_SUMMARY, RAG_AUTO_TAG, RAG_AUTO_PREINDEX
+from config import UPLOAD_DIR, RAG_ENTITY_EXTRACT, RAG_ENTITY_LLM, RAG_AUTO_SUMMARY, RAG_AUTO_TAG, RAG_AUTO_PREINDEX, RAG_AUTO_SEMANTIC, RAG_AUTO_DOC_SIM
 
 from . import engine
 
@@ -246,3 +246,33 @@ def _stage_preindex(ctx: dict):
             answers[q] = ""
     ctx["preindex"] = answers
     logger.info(f"文件 {ctx.get('file_id')} 预索引完成（{len(answers)} 问）")
+
+
+@engine.register_stage("semantic", stage_type="async")
+def _stage_semantic(ctx: dict):
+    """语义边构建：compatible_process + 标准字段（standard_domain）+ uses_standard
+
+    幂等：全库扫描 material/standard 实体重算语义边，入库后后台跑，失败不阻断。
+    """
+    if RAG_AUTO_SEMANTIC != "1":
+        return
+    try:
+        from src.extraction.relation_builder import build_semantic_edges
+        result = build_semantic_edges()
+        logger.info(f"文件 {ctx.get('file_id')} 语义边构建完成: {result}")
+    except Exception as e:
+        logger.warning(f"语义边构建失败（已忽略）: {e}")
+
+
+@engine.register_stage("docsim", stage_type="async")
+def _stage_docsim(ctx: dict):
+    """文档相似度边构建（similar）：增量计算当前文件与其余文件的相似度"""
+    if RAG_AUTO_DOC_SIM != "1":
+        return
+    try:
+        from src.extraction.relation_builder import build_document_similarity_edges
+        file_id = ctx.get("file_id")
+        count = build_document_similarity_edges(file_id=file_id)
+        logger.info(f"文件 {file_id} 文档相似度边构建完成: {count} 条")
+    except Exception as e:
+        logger.warning(f"文档相似度边构建失败（已忽略）: {e}")

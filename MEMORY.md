@@ -494,3 +494,33 @@
 - GraphView：双图谱 d3 渲染 + /graph + /entities/graph + /entities/{id} 反链全真实现
 - DocumentDetail：删除/改分类/改标签（ElMessageBox+api+错误处理）全真实现
 - PluginsView：启停/卸载/调用 + SchemaForm 声明式渲染 + SchemaResult 全真实现
+
+## 第八轮：分类标准一致性检测与统一（2026-08-18 用户问「分类标准是否一致」）
+答案：不一致，存在 3 套互相打架的分类体系（违背「统一」原则）
+
+### 诊断：三套分类体系
+1. 文档分类 ingest._auto_classify（写 files.category）：外购件选型/设计手册/材料选型/连接器/标准件/工艺规程/测试报告/未分类
+2. 查询分类 ranking._CATEGORY_KW（检索加权）：连接器/机械设计/材料选型/工艺规程/标准件/品质管理/电气自动化
+3. 标准号领域 entity_extractor.STANDARD_CATEGORY_RULES（实体 attributes.category）：基础标准/电工标准/德国标准/汽车标准/国际标准/材料/机械制图/工艺/紧固件
+
+### 不一致点（同义不同名/维度混乱）
+- 「测试报告」vs「品质管理」、「设计手册」vs「机械设计」、「标准件」vs「紧固件」同义不同名
+- 体系③维度完全不同（按标准来源/前缀分，非内容题材），却挤进同一个 category 世界观
+- 前端的 STD_CATEGORY_COLORS（有轴承/密封件/公差配合/电工）与后端规则输出（电工标准/基础标准/汽车标准）也对不上
+
+### 修复（用户选定「统一①②为单一词典」方案）
+- 新增 src/classification.py：单一权威题材词典 CATEGORY_DICT（8类：外购件选型/连接器/材料选型/工艺规程/标准件/机械设计/品质管理/电气自动化）
+- _auto_classify 与 _CATEGORY_KW 统一指向 CATEGORY_DICT（is 同一对象，真共享）
+- 体系③「标准号领域」重命名为 standard_domain（隔离自文档题材分类），键名从 attributes.category 改为 attributes.standard_domain
+- 标准领域词表统一到 STANDARD_DOMAINS（材料/紧固件/工艺/机械制图/电工/轴承/密封件/公差配合/基础标准/其他），规则与 LLM 共用同一套
+- GraphView STD_CATEGORY_COLORS 重写，与后端 STANDARD_DOMAINS 一一对应
+- 新增 scripts/migrate_classification.py 幂等迁移脚本
+
+### 数据迁移 + 验证
+- files.category：设计手册→机械设计（2个文件）
+- 467 个标准实体回填 standard_domain，分布：紧固件214/材料117/机械制图97/轴承12/其他10/工艺5/公差配合4/基础标准3/密封件3/电工2
+- 检索/对话/图谱回归全 200
+
+### 教训
+- 三个模块各写各的 keyword 表 = 分类标准分裂，检索加权时 query 判「品质管理」而文档标「测试报告」会悄悄失效
+- 「单一权威词典 + 常量文件」是消除分裂的正解；标准来源（IEC/DIN/ISO）是另一维度，不该混进内容领域
