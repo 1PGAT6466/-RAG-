@@ -250,7 +250,12 @@ async function fetchGraph() {
     if (mode.value === 'document') {
       const { data } = await api.get('/graph')
       nodes.value = data.data.nodes || []
-      edges.value = data.data.edges || []
+      // 文档图边字段映射：source_id/target_id → source/target（d3 forceLink 约定）
+      edges.value = (data.data.edges || []).map(e => ({
+        ...e,
+        source: e.source_id ?? e.source,
+        target: e.target_id ?? e.target,
+      }))
       buildDocLegend()
     } else {
       // 实体图：全量拉取，筛选在前端本地做（支持 standard 按 category 细分）
@@ -441,9 +446,6 @@ function renderGraph() {
     .attr('dy', d => d.radius + 14)
     .attr('font-size', 11)
     .attr('fill', 'var(--text-secondary)')
-
-  // 边的 id 匹配：文档图用 id，实体图用 source_id/target_id
-  const linkId = (d) => isEntity ? d.source_id ?? d.source : d.id
 
   simulation = d3.forceSimulation(nData)
     .force('link', d3.forceLink(edges.value).id(d => d.id).distance(isEntity ? 90 : 100))
