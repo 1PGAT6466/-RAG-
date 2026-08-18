@@ -582,3 +582,27 @@
 - 「函数被淘汰但没删」是死代码主要来源：_chinese_text_quality 就是被 jieba 多字词法替代后的残留
 - 删除前必须验证：①零 AST 引用 ②不在 scripts/ 被引用 ③无同名相似函数混淆（get_embedding_dim vs get_embedding_dimension）
 - 结果：8 文件 -181 行净减，全链路回归 200
+
+## 第十一轮：性能 + 异常边界 + 前端 UI 细节（2026-08-18 用户「性能、异常边界、前端UI 都需要」）
+
+### 性能优化
+- ranking.exact_match_boost：jieba 关键词分词(_query_terms)提到 for 循环外，消除「每个候选 chunk 重复切 query」的 N 次冗余
+- chat/engine.generate：新增 LLM key 前置检查，MIMO+DEEPSEEK 均空时快速失败给出明确提示；MiMo 失败且 DeepSeek 未配时明确报错（不再裸 401 后静默降级）
+
+### 异常边界（关键修复）
+- search.py 新增「相关性看门」：BM25 与图谱召回均空 → 直接返回空、不融合不 rerank 不调 LLM
+- api_chat：检索空结果快速返回友好提示，避免 LLM 对空上下文编造
+- 根因洞察：**向量检索对任意 query（含纯字母乱码）都无条件返回 top_k**，bge-large 对 ASCII 字母串余弦相似度仍达 0.5+，无法用相似度阈值区分「乱码 vs 真实中文查询」（实测真实查询 0.54~0.69 vs 字母乱码 0.53 高度重叠）。唯一可靠判据是 BM25/FTS 词汇级真实命中
+- 曾踩坑：先试了 chroma_store.search 加 VECTOR_MIN_SCORE=0.35 阈值，误伤正常查询（「连接器接触电阻」返回0），实测后撤回，改用 BM25/图谱看门
+
+### 前端
+- ChatView：renderAnswer 改 computed 缓存（renderedHtml Map），避免消息列表增长后每次渲染重算全部历史 markdown
+- DocumentDetail：加载失败显示 error + 重试按钮（原为静默 console.error 永久 loading）
+
+### ⚠️ 重大教训：PowerShell 5.1 中文 query 编码坑
+- 用 Invoke-RestMethod 发中文 JSON body 时，PowerShell 5.1 会把 UTF-8 中文破坏成 ???，导致 FTS 检索全 0 条，误以为是服务端 bug 排查了很久
+- 正确做法：curl.exe + [System.IO.File]::WriteAllBytes(tmp, [Text.Encoding]::UTF8.GetBytes(body)) + --data-binary "@tmp"
+- 服务端其实零 bug，是测试脚本编码问题；但据此事固定了「空结果快速返回」的正确性
+
+### admin 账号密码
+- admin / admin123（本轮回归验证用，之前记忆未存，现已补）

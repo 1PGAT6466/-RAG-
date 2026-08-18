@@ -137,6 +137,9 @@ def rerank_local(query, candidates, top_k=30):
     if not tokens:
         return candidates[:top_k]
 
+    # 提前 lower 一次，避免循环内对每个 token 重复 .lower()
+    tokens = [t.lower() for t in tokens]
+
     scored = []
     for r in candidates:
         text = _text_of(r).lower()
@@ -146,9 +149,9 @@ def rerank_local(query, candidates, top_k=30):
         score = 0.0
         text_len = max(len(text), 1)
         for t in tokens:
-            count = text.count(t.lower())
+            count = text.count(t)  # 一次 count 既得词频又可判断存在（省掉重复的 in 判断）
             score += count / text_len * 1000
-            if t.lower() in text:
+            if count:
                 score += 5
         original = float(r.get("score", 0))
         rr = dict(r)

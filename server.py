@@ -101,9 +101,16 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.error(f"未处理异常 {request.method} {request.url.path}: {exc}", exc_info=True)
+    # 数据库锁/连接失败等基础设施错误：返回可读的 detail 而非笼统的「服务器内部错误」，
+    # 便于前端定位是网络/服务/数据层问题（生产环境可另设开关隐藏内部细节）
+    detail = "服务器内部错误"
+    if isinstance(exc, __import__("sqlite3").OperationalError) and "locked" in str(exc).lower():
+        detail = "数据库忙，请稍后重试"
+    elif "LLM 服务" in str(exc) or "LLM 调用" in str(exc):
+        detail = str(exc)
     return JSONResponse(
         status_code=500,
-        content={"status": "error", "detail": "服务器内部错误"},
+        content={"status": "error", "detail": detail},
     )
 
 # 注册路由

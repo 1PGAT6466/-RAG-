@@ -127,6 +127,9 @@ def _get_conn() -> sqlite3.Connection:
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
         _local.conn.execute("PRAGMA foreign_keys=ON")
+        # 写锁等待超时：多线程并发写（uvicorn async + 引擎 worker + watcher 进程）时
+        # 遇锁等待而非立即 database is locked（对齐 plugins/registry.py 的正确做法）
+        _local.conn.execute("PRAGMA busy_timeout=5000")
     return _local.conn
 
 
@@ -310,24 +313,27 @@ def sync_chunk_count(file_id: int):
 
 def add_chunks_batch(rows: list[tuple]) -> list[int]:
     """批量插入 [(file_id, idx, content, token_count, embedding_bytes, metadata_dict), ...]
-    返回 chunk 真实 id 列表"""
+    返回 chunk 真实 id 列表
+
+    用显式事务包住（with conn: 自动 BEGIN/COMMIT），一次提交减少写锁窗口；
+    逐条 INSERT 并取真实 rowid（executemany 的 lastrowid 不可靠，见 MEMORY）。
+    """
     conn = _get_conn()
     data = [(r[0], r[1], r[2], r[3], r[4], _dumps(r[5] or {})) for r in rows]
-    # 逐条插入并返回真实 rowid，避免 executemany 的 lastrowid 不可靠
     from src.storage.tokenizer import segment_for_fts
     chunk_ids = []
-    for row in data:
-        cur = conn.execute(
-            "INSERT INTO chunks (file_id, chunk_index, content, token_count, embedding, metadata) "
-            "VALUES (?,?,?,?,?,?)", row
-        )
-        rowid = cur.lastrowid
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
-            (rowid, segment_for_fts(row[2]))
-        )
-        chunk_ids.append(rowid)
-    conn.commit()
+    with conn:  # 显式事务：批量提交，缩短写锁持有时间
+        for row in data:
+            cur = conn.execute(
+                "INSERT INTO chunks (file_id, chunk_index, content, token_count, embedding, metadata) "
+                "VALUES (?,?,?,?,?,?)", row
+            )
+            rowid = cur.lastrowid
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)",
+                (rowid, segment_for_fts(row[2]))
+            )
+            chunk_ids.append(rowid)
     return chunk_ids
 
 
