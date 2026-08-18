@@ -8,6 +8,16 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 
+# 关闭 chromadb 遥测（必须在首次 import chromadb 之前设置）
+# 根因：chromadb 0.6.3 是按 posthog-python 3.x API 写的（capture(distinct_id, event, props)），
+#   但本机装的是 posthog 7.38.0（capture(event, **kwargs)），多传参数会报
+#   "capture() takes 1 positional argument but 3 were given"。此报错纯属噪音（遥测无用），
+#   直接静默 chromadb 的 telemetry logger 最干净，无需降级依赖。
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+import logging as _logging
+_logging.getLogger("chromadb.telemetry").setLevel(_logging.CRITICAL)
+_logging.getLogger("chromadb.telemetry.product.posthog").setLevel(_logging.CRITICAL)
+
 
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
