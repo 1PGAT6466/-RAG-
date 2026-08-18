@@ -688,3 +688,22 @@
 
 ### admin 账号
 - admin / admin123；另有 user 账号（密码未探明，不需）
+
+## 第十五轮：五项反馈改进（2026-08-18，第一批）
+用户提出 5 条需求，先出方案文档 `docs/五项改进整体方案.md`，然后依次开工。
+
+### 已落地（第一批）
+1. **语言归一化**（#2）：新增 `src/pipeline/language_filter.py`，高置信度繁转简（只转一对一无歧义映射，歧义字如乾/髮/後不转）+ 去日文/韩文/乱码 + 非中文长块丢弃。接入 `chunker.chunk_text` 末尾（两路入库统一生效）。flag `RAG_LANG_FILTER=1`。用户要求「不100%确定就不转」已落实。
+2. **三模式对话**（#1）：新增 `src/chat/router.py`（规则意图分类 chat/knowledge/web，9/9准确）+ `generate_chat`（闲聊）+ `generate_web`（联网）+ `src/chat/web_search.py`（Tavily）。api_chat 加 mode 参数。ChatView 加模式切换（自动/知识库/闲聊/联网）+ 多轮历史。
+3. **联网搜索**（#1 含，意外提前完成）：Tavily key 已通过进程环境变量存在（`tvly-dev-...`，easyclaw 环境注入，非 .env），直接实现 web 模式，端到端验证通过。
+4. **插件调用面板**（#4）：发现已完整实现（PluginsView 有 SchemaForm 调用面板 + store.invoke + api.invoke + 后端 /invoke），端到端验证通过（example-plugin echo/add 正常）。
+
+### 关键事实/坑
+- **TAVILY_API_KEY 敏感**：值是 `tvly-dev-tTxRQ-...`（在进程环境变量，非 .env），config 用 os.getenv 读到。切勿外泄。
+- 三模式已验证：闲聊（自我介绍）、RAG（镀金层，带引用）、web（北京天气，带[2][3][4]来源标注）。
+- Tavily 搜索接口：POST https://api.tavily.com/search，body {api_key, query, max_results, search_depth}。
+
+### 待办（第二、三批）
+- 图谱布局优化 + hover 聚焦（#3）
+- 界面质感升级（#5，参考 easyclaw/mimo/obsidian/workbuddy）
+- MCP 市场接入（#4，阶段3，用户确认先面板后市场）

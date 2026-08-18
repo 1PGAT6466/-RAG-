@@ -15,6 +15,8 @@
           <el-option v-for="r in relTypeFilter" :key="r.name" :label="`${r.label} (${r.count})`" :value="r.name" />
         </el-select>
       </div>
+
+      <el-checkbox v-model="showLabels" style="margin-left:auto">显示标签</el-checkbox>
     </div>
 
     <!-- 图谱画布 -->
@@ -143,6 +145,8 @@ const allEdges = ref([])
 // 大图截断：节点数超过上限时按度取 Top 核心节点（避免 SVG 全量渲染卡死）
 const MAX_GRAPH_NODES = 300
 const graphTruncated = ref(false)
+// 是否始终显示节点标签（默认关闭，hover 显示，Obsidian 风格）
+const showLabels = ref(false)
 
 let simulation = null
 
@@ -243,6 +247,7 @@ onUnmounted(() => {
 watch(mode, () => fetchGraph())
 watch(activeTypes, () => { applyNodeFilter(); applyEdgeFilter(); buildEntityLegend(); renderGraph() })
 watch(activeRelTypes, () => { applyEdgeFilter(); renderGraph() })
+watch(showLabels, () => renderGraph())
 
 async function fetchGraph() {
   loading.value = true
@@ -408,16 +413,16 @@ function renderGraph() {
     ...n,
     color: isEntity ? nodeColor(n) : docColors[(n.category || '') .length % docColors.length],
     radius: isEntity
-      ? Math.max(10, Math.min(36, (n.degree || 0) * 2 + 10))
-      : Math.max(8, Math.min(30, (n.chunk_count || 1) * 2 + 6))
+      ? Math.max(8, Math.min(24, Math.sqrt((n.degree || 0) * 6) + 6))
+      : Math.max(7, Math.min(22, Math.sqrt((n.chunk_count || 1) * 6) + 5))
   }))
 
   const link = g.append('g').selectAll('line')
     .data(edges.value)
     .join('line')
     .attr('stroke', d => isEntity ? relColor(d.rel_type) : '#c8c8c8')
-    .attr('stroke-width', d => Math.max(0.5, (d.weight || 1) * 0.4))
-    .attr('stroke-opacity', d => (isEntity && d.rel_type === 'cooccur') ? 0.25 : 0.7)
+    .attr('stroke-width', d => Math.max(0.4, (d.weight || 1) * 0.3))
+    .attr('stroke-opacity', d => (isEntity && d.rel_type === 'cooccur') ? 0.10 : 0.45)
 
   const node = g.append('g').selectAll('g')
     .data(nData)
@@ -432,6 +437,8 @@ function renderGraph() {
       if (isEntity) openEntityDetail(d.id, d.name)
       else router.push(`/document/${d.id}`)
     })
+    .on('mouseover', (e, d) => highlightNeighbors(d))
+    .on('mouseout', () => clearHighlight())
 
   node.append('circle')
     .attr('r', d => d.radius)
@@ -446,17 +453,62 @@ function renderGraph() {
     .attr('dy', d => d.radius + 14)
     .attr('font-size', 11)
     .attr('fill', 'var(--text-secondary)')
+    .attr('opacity', showLabels.value ? 1 : 0)  // 默认隐藏标签，hover 时显示（Obsidian 风格）
+    .attr('pointer-events', 'none')
 
   simulation = d3.forceSimulation(nData)
-    .force('link', d3.forceLink(edges.value).id(d => d.id).distance(isEntity ? 90 : 100))
-    .force('charge', d3.forceManyBody().strength(isEntity ? -250 : -200))
+    .force('link', d3.forceLink(edges.value).id(d => d.id).distance(isEntity ? 70 : 90))
+    .force('charge', d3.forceManyBody().strength(isEntity ? -300 : -260))
     .force('center', d3.forceCenter(width / 2, height / 2))
-    .force('collision', d3.forceCollide().radius(d => d.radius + 10))
+    .force('x', d3.forceX(width / 2).strength(0.05))
+    .force('y', d3.forceY(height / 2).strength(0.05))
+    .force('collision', d3.forceCollide().radius(d => d.radius + 6))
     .on('tick', () => {
       link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
         .attr('x2', d => d.target.x).attr('y2', d => d.target.y)
       node.attr('transform', d => `translate(${d.x},${d.y})`)
     })
+
+  // === hover 高亮邻接（Obsidian 式交互）===
+  function highlightNeighbors(d) {
+    // 找出直接邻居 id（实体图边已映射 source/target；文档图映射后也是 source/target）
+    const neighborIds = new Set([d.id])
+    edges.value.forEach(e => {
+      const s = e.source_id ?? e.source
+      const t = e.target_id ?? e.target
+      // source/target 可能是对象（forceLink 已解析）或原始 id
+      const sid = typeof s === 'object' ? s.id : s
+      const tid = typeof t === 'object' ? t.id : t
+      if (sid === d.id) neighborIds.add(tid)
+      if (tid === d.id) neighborIds.add(sid)
+    })
+    // 高亮邻居节点，淡出其余
+    node.select('circle')
+      .attr('fill-opacity', n => neighborIds.has(n.id) ? 0.9 : 0.12)
+    node.select('text')
+      .attr('opacity', n => neighborIds.has(n.id) ? 1 : 0)
+      .attr('fill-opacity', n => neighborIds.has(n.id) ? 1 : 0.15)
+    // 边：连接邻居的高亮，其余淡出
+    link
+      .attr('stroke-opacity', e => {
+        const s = e.source_id ?? e.source
+        const t = e.target_id ?? e.target
+        const sid = typeof s === 'object' ? s.id : s
+        const tid = typeof t === 'object' ? t.id : t
+        const isNeighborEdge = neighborIds.has(sid) && neighborIds.has(tid)
+        return isNeighborEdge ? 0.6 : 0.03
+      })
+  }
+
+  function clearHighlight() {
+    node.select('circle')
+      .attr('fill-opacity', 0.8)
+    node.select('text')
+      .attr('opacity', showLabels.value ? 1 : 0)
+      .attr('fill-opacity', 1)
+    link
+      .attr('stroke-opacity', e => (isEntity && e.rel_type === 'cooccur') ? 0.10 : 0.45)
+  }
 }
 
 async function openEntityDetail(id, name) {
