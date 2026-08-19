@@ -707,3 +707,28 @@
 - 图谱布局优化 + hover 聚焦（#3）
 - 界面质感升级（#5，参考 easyclaw/mimo/obsidian/workbuddy）
 - MCP 市场接入（#4，阶段3，用户确认先面板后市场）
+
+## 第二批：图谱交互优化已落地（2026-08-19）
+- GraphView.vue：力导向参数调优（斥力 -300/-260、边距 70/90、cooccur 边淡到 0.10 透明白、节点尺寸 sqrt 平滑）+ forceX/forceY 平衡居中
+- hover 高亮邻接（悬停节点高亮它+直接邻居，其余淡出）
+- 标签默认隐藏（Obsidian 风格）、hover 显示，顶部「显示标签」开关
+- 构建验证通过
+
+## 第三批：MCP 市场已落地（2026-08-19）
+- 后端已有（之前埋的）：src/mcp/ 四文件（client/manager/smithery/__init__）+ src/api_mcp.py 六端点（market/installed/install/uninstall/tools/call）
+- 前端新增：frontend/src/views/McpMarket.vue（市场浏览/已安装/工具调用三区）+ frontend/src/api/mcp.js
+- router 新增 /mcp（管理员专属，与 /plugins 同拦截）；MainLayout 侧边栏加「MCP 市场」入口（Shop 图标）
+- 后端 api_mcp 注册方式：src/api.py 末尾 api_mcp.register(router)（与 api_plugins 同，已确认已挂载，之前误判「未注册」）
+
+### MCP 市场关键坑（本轮踩）
+1. **qualifiedName 含斜杠导致 404**：@scope/name 型 qualifiedName 在路径参数里被 / 切分。修复：api_mcp 的 tools/call 两路由改 `{qualified_name:path}` 转换器
+2. **uninstall 端点误用 McpInstallReq**（要求 command 必填）→ 新增 McpUninstallReq（只 qualifiedName），否则卸载报 422
+3. **CONNECT_TIMEOUT 20s 不够**：npx 首次冷启动要下载包，超时报 `unhandled errors in a TaskGroup`。已提至 60s；且验证时需先 npx 预热缓存
+4. **scripts/mini_mcp_server.py 非标准 MCP**：是纯换行 JSON-RPC，缺 Content-Length 帧头，不能作 mcp 库 stdio_client 的测试目标。真实测试用 npx @modelcontextprotocol/server-everything（echo 工具）
+5. **依赖**：mcp python 包已 pip 安装（import 无 __version__ 属性但 ClientSession/StdioServerParameters/stdio_client 可用）；httpx 0.28.1 已有
+6. **Smithery registry**：https://registry.smithery.ai/servers，返回 servers[] 数组，字段 qualifiedName/displayName/description/verified/useCount/homepage，正常返回约 10 个 server
+
+### MCP 端到端验证通过（2026-08-19）
+- market 200 返回 10 server；installed 空；未登录 401
+- 安装 npx server-everything → tools 列 13 个（echo/get-env 等）→ call echo('端到端测试') 返回 'Echo: 端到端测试'
+- 卸载验证通过，清理后 installed 归空

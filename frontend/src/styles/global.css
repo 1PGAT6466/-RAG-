@@ -6,6 +6,8 @@
   --bg-secondary: #f7f8fa;
   --bg-tertiary: #eef0f4;
   --bg-hover: #f0f2f5;
+  --bg-elevated: #ffffff;
+  --bg-subtle: #f5f6f8;
 
   /* 主色：蓝紫渐变系（更有质感，替代单调 #1677ff） */
   --accent: #4f6ef7;
@@ -494,8 +496,47 @@ body {
   border-radius: var(--radius);
 }
 
+/* 弹窗/下拉/悬浮层细腻化 */
+.el-dialog {
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+.el-dialog__header {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;
+  margin-right: 0;
+}
+.el-dialog__title {
+  font-weight: 600;
+  font-size: 15px;
+}
+.el-popper.is-light {
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+}
+.el-select-dropdown {
+  border-radius: var(--radius-sm);
+}
+
+/* 空状态精致化 */
+.empty-state .el-icon {
+  opacity: 0.75;
+}
+
 /* 主色过渡动画 */
 .fade-enter-active, .fade-leave-active {
   transition: opacity 0.2s;
 }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* 页面切换淡入过渡 */
+.page-fade-enter-active, .page-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.page-fade-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.page-fade-leave-to {
+  opacity: 0;
+}

@@ -1,9 +1,11 @@
 <template>
-  <div style="display:flex;height:100%;overflow:hidden">
+  <div class="docs-page">
     <!-- 左侧分类 -->
-    <div style="width:200px;min-width:200px;background:var(--bg-primary);border-right:1px solid var(--border);padding:12px;overflow-y:auto">
-      <el-input v-model="searchText" placeholder="搜索文档..." size="small" style="margin-bottom:12px" clearable />
-      <div style="font-size:12px;color:var(--text-tertiary);margin-bottom:8px;font-weight:600">分类</div>
+    <aside class="docs-sidebar">
+      <el-input v-model="searchText" placeholder="搜索文档..." size="small" class="docs-search" clearable>
+        <template #prefix><el-icon><Search /></el-icon></template>
+      </el-input>
+      <div class="docs-sidebar-label">分类</div>
       <div class="category-tree">
         <div class="category-item"
           :class="{ active: activeCategory === '' }"
@@ -20,12 +22,12 @@
           <span class="category-count">{{ cat.count }}</span>
         </div>
       </div>
-    </div>
+    </aside>
 
     <!-- 右侧文档区 -->
-    <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
-      <div style="padding:12px 16px;background:var(--bg-primary);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span style="font-weight:600">{{ activeCategory || '全部文档' }}</span>
+    <section class="docs-main">
+      <div class="docs-toolbar">
+        <span class="docs-toolbar-title">{{ activeCategory || '全部文档' }}</span>
         <input
           ref="fileInput"
           type="file"
@@ -44,13 +46,13 @@
           @change="onFilesSelected"
         />
         <el-button v-if="auth.isAdmin" type="primary" size="small" :icon="Upload" @click="$refs.fileInput.click()">上传文档</el-button>
-        <el-button v-if="auth.isAdmin" size="small" :icon="Folder" @click="$refs.folderInput.click()" style="margin-left:8px">上传文件夹</el-button>
-        <span v-if="uploading" style="font-size:12px;color:var(--accent)">{{ uploadProgress }}</span>
+        <el-button v-if="auth.isAdmin" size="small" :icon="Folder" @click="$refs.folderInput.click()">上传文件夹</el-button>
+        <span v-if="uploading" class="docs-upload-status">{{ uploadProgress }}</span>
       </div>
 
-      <!-- 字段筛选栏：型号/材料/日期（阶段 3） -->
-      <div style="padding:8px 16px;background:var(--bg-secondary);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        <span style="font-size:12px;color:var(--text-tertiary)">筛选：</span>
+      <!-- 字段筛选栏：型号/材料/日期 -->
+      <div class="docs-filter-bar">
+        <span class="docs-filter-label">筛选</span>
         <el-select v-model="filterModel" placeholder="型号" clearable filterable size="small" style="width:160px" @change="onFilterChange">
           <el-option v-for="m in allModels" :key="m" :label="m" :value="m" />
         </el-select>
@@ -65,19 +67,18 @@
         </el-select>
         <el-button size="small" text type="primary" @click="clearFilter">重置</el-button>
 
-        <div style="flex:1"></div>
-        <!-- 视图切换：卡片 / 表格 -->
+        <div class="docs-filter-spacer"></div>
         <el-radio-group v-model="viewMode" size="small">
           <el-radio-button value="card">卡片</el-radio-button>
           <el-radio-button value="table">表格</el-radio-button>
         </el-radio-group>
       </div>
 
-      <div style="flex:1;overflow-y:auto">
+      <div class="docs-list-area">
         <div v-if="filteredFiles.length === 0" class="empty-state">
           <el-icon><Folder /></el-icon>
           <p>暂无文档</p>
-          <p style="font-size:12px">上传 PDF、PPT、XLSX 或 DOCX 文件开始使用</p>
+          <p class="empty-sub">上传 PDF、PPT、XLSX 或 DOCX 文件开始使用</p>
         </div>
 
         <!-- 表格视图 -->
@@ -119,7 +120,7 @@
                 </div>
               </div>
             </div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+            <div class="doc-card-tags">
               <span class="tag" v-if="f.category">{{ f.category }}</span>
               <span class="tag tag-model" v-for="m in (f.models || []).slice(0, 4)" :key="'m'+m">{{ m }}</span>
               <span class="tag tag-material" v-for="m in (f.materials || []).slice(0, 4)" :key="'mat'+m">{{ m }}</span>
@@ -127,13 +128,13 @@
           </div>
         </div>
       </div>
-    </div>
+    </section>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { Upload, Folder } from '@element-plus/icons-vue'
+import { Upload, Folder, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { useAuthStore } from '../stores/auth'
@@ -328,3 +329,99 @@ onMounted(() => {
   fetchFiles()
 })
 </script>
+
+<style scoped>
+.docs-page {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* 左侧分类 */
+.docs-sidebar {
+  width: 208px;
+  min-width: 208px;
+  background: var(--bg-primary);
+  border-right: 1px solid var(--border);
+  padding: 16px 12px;
+  overflow-y: auto;
+}
+.docs-search {
+  margin-bottom: 16px;
+}
+.docs-sidebar-label {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-bottom: 8px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+/* 右侧主区 */
+.docs-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* 顶部工具栏 */
+.docs-toolbar {
+  padding: 16px 20px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.docs-toolbar-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-right: 8px;
+}
+.docs-upload-status {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* 筛选栏 */
+.docs-filter-bar {
+  padding: 10px 20px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.docs-filter-label {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-weight: 600;
+}
+.docs-filter-spacer {
+  flex: 1;
+}
+
+/* 列表区 */
+.docs-list-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+}
+.doc-card-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.empty-sub {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+</style>
