@@ -309,5 +309,9 @@ async def api_health():
 from src import api_plugins
 api_plugins.register(router)
 
+# === MCP 市场 API ===
+from src import api_mcp
+api_mcp.register(router)
+
 
 

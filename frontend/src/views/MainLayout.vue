@@ -24,6 +24,9 @@
         <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/plugins' }" @click="$router.push('/plugins')">
           <el-icon><Grid /></el-icon> 插件
         </div>
+        <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/mcp' }" @click="$router.push('/mcp')">
+          <el-icon><Shop /></el-icon> MCP 市场
+        </div>
         <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:12px">
           <div class="user-badge" :class="{ 'user-badge--admin': auth.isAdmin }">
             <span class="user-avatar">{{ (auth.username || '?')[0] }}</span>

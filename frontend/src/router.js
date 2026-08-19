@@ -10,6 +10,7 @@ const routes = [
       { path: 'documents', name: 'Documents', component: () => import('./views/DocumentsView.vue') },
       { path: 'graph', name: 'Graph', component: () => import('./views/GraphView.vue') },
       { path: 'plugins', name: 'Plugins', component: () => import('./views/PluginsView.vue') },
+      { path: 'mcp', name: 'McpMarket', component: () => import('./views/McpMarket.vue') },
       { path: 'document/:id', name: 'DocumentDetail', component: () => import('./views/DocumentDetail.vue') },
     ]
   },
@@ -28,8 +29,8 @@ router.beforeEach((to, from) => {
   if (to.path !== '/login' && !token) {
     return '/login'
   }
-  // 管理员专属路由（插件管理）拦截普通用户
-  if (to.path === '/plugins' && role !== 'admin') {
+  // 管理员专属路由（插件/MCP 管理）拦截普通用户
+  if ((to.path === '/plugins' || to.path === '/mcp') && role !== 'admin') {
     return '/'
   }
   return true
