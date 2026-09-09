@@ -51,7 +51,7 @@ function formatVal(v) {
 
 <style scoped>
 .schema-result { font-size: 13px; }
-.result-error { color: #f56c6c; }
+.result-error { color: var(--color-danger); }
 .result-error-title { font-weight: 600; margin-bottom: 4px; }
 .result-error pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; }
 .result-ok { color: var(--text-primary); }

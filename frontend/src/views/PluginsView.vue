@@ -1,23 +1,20 @@
 <template>
   <div class="plugins-view">
     <!-- 顶部标题栏 -->
-    <div class="plugins-header">
-      <div>
-        <h2 style="font-size:20px">插件管理</h2>
-        <div style="font-size:12px;color:var(--text-tertiary);margin-top:4px">
-          已加载 {{ plugins.length }} 个插件 · 启用 {{ enabledPlugins.length }} 个
-        </div>
+    <div class="page-header">
+      <div class="page-header-left">
+        <h2 class="page-title"><el-icon><Grid /></el-icon>插件管理</h2>
+        <p class="page-subtitle">已加载 {{ plugins.length }} 个插件 · 启用 {{ enabledPlugins.length }} 个</p>
       </div>
-      <el-button size="small" :icon="Refresh" @click="refresh" :loading="loading">刷新</el-button>
+      <div class="page-header-actions">
+        <el-button size="small" :icon="Refresh" @click="refresh" :loading="loading">刷新</el-button>
+      </div>
     </div>
 
     <div class="plugins-body">
       <!-- 左侧插件列表 -->
       <div class="plugins-list">
-        <div v-if="plugins.length === 0" class="empty-state">
-          <p>暂无插件</p>
-          <p style="font-size:12px">在 plugins/ 目录下放置 manifest.json 即可加载</p>
-        </div>
+        <EmptyState v-if="plugins.length === 0" icon="Grid" title="暂无插件" hint="在 plugins/ 目录下放置 manifest.json 即可加载" />
         <div
           v-for="p in plugins"
           :key="p.name"
@@ -42,7 +39,7 @@
 
       <!-- 右侧详情 -->
       <div class="plugins-detail" v-if="current">
-        <h3 style="font-size:16px;margin-bottom:16px">{{ current.manifest?.display_name || current.name }}</h3>
+        <h3 class="plugin-detail-title">{{ current.manifest?.display_name || current.name }}</h3>
 
         <!-- 操作按钮 -->
         <div style="display:flex;gap:8px;margin-bottom:20px">
@@ -91,18 +88,13 @@
 
         <!-- Workflow 型提示 -->
         <template v-else-if="current.kind === 'workflow'">
-          <div class="empty-state">
-            <p>Workflow 插件</p>
-            <p style="font-size:12px">通过挂载到入库/检索节点自动执行</p>
-          </div>
+          <EmptyState title="Workflow 插件" hint="通过挂载到入库/检索节点自动执行" />
         </template>
       </div>
 
       <!-- 右侧空态 -->
       <div class="plugins-detail" v-else>
-        <div class="empty-state">
-          <p>选择一个插件查看详情</p>
-        </div>
+        <EmptyState title="选择一个插件查看详情" />
       </div>
     </div>
   </div>
@@ -110,8 +102,9 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { Refresh, Grid } from '@element-plus/icons-vue'
+import EmptyState from '../components/EmptyState.vue'
+// ElMessage/ElMessageBox 由 unplugin-auto-import 自动引入（含样式）
 import { usePluginsStore } from '../stores/plugins'
 import SchemaForm from '../components/SchemaForm.vue'
 import SchemaResult from '../components/SchemaResult.vue'
@@ -206,14 +199,6 @@ async function invokeTool() {
 
 <style scoped>
 .plugins-view { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
-.plugins-header {
-  padding: 16px 20px;
-  background: var(--bg-primary);
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
 .plugins-body { flex: 1; display: flex; overflow: hidden; }
 .plugins-list {
   width: 320px;
@@ -239,6 +224,12 @@ async function invokeTool() {
 .plugin-card-meta { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--text-tertiary); margin-bottom: 6px; }
 .plugin-card-desc { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .plugins-detail { flex: 1; overflow-y: auto; padding: 20px; background: var(--bg-primary); }
+.plugin-detail-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  color: var(--text-primary);
+}
 .section-title { font-weight: 600; margin-bottom: 10px; color: var(--text-primary); }
 .empty-state { text-align: center; color: var(--text-tertiary); padding: 40px 0; }
 </style>

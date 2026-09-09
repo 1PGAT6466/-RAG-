@@ -1,6 +1,6 @@
 @echo off
 title FuXi RAG Service
-cd /d E:\??RAG??
+cd /d E:\¸üÐÂRAG¿ò¼Ü
 
 echo ============================================
 echo    FuXi RAG - Start Service

@@ -1,6 +1,6 @@
 @echo off
 title Stop FuXi RAG Service
-cd /d E:\??RAG??
+cd /d E:\¸üÐÂRAG¿ò¼Ü
 
 echo ============================================
 echo    FuXi RAG - Stop Service

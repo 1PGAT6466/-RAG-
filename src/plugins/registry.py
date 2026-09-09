@@ -9,7 +9,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from config import DATA_DIR
+from config import DATA_DIR, SQLITE_BUSY_TIMEOUT
 
 _DB_PATH = str(DATA_DIR / "plugins.db")
 
@@ -37,7 +37,7 @@ def _get_conn() -> sqlite3.Connection:
         _local.conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         _local.conn.row_factory = sqlite3.Row
         _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute("PRAGMA busy_timeout=5000")
+        _local.conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT}")
     return _local.conn
 
 

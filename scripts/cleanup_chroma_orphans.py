@@ -47,14 +47,10 @@ def main(dry_run: bool = False):
         print(f"[dry-run] 将删除 {len(orphans)} 个孤儿向量，示例: {orphans[:10]}")
         return
 
-    # 分批删除（Chroma delete 一次性传大量 id 可能较慢）
-    BATCH = 500
-    for i in range(0, len(orphans), BATCH):
-        batch = orphans[i:i + BATCH]
-        col.delete(ids=[str(cid) for cid in batch])
-        print(f"  已删除 {min(i + BATCH, len(orphans))}/{len(orphans)}")
-
-    print(f"清理完成，删除 {len(orphans)} 个孤儿向量 ✅")
+    # 批量删除（复用 delete_where，一次/分批调用 col.delete，避免逐条删卡死）
+    from src.storage.chroma_store import delete_where
+    deleted = delete_where([str(cid) for cid in orphans])
+    print(f"清理完成，删除 {deleted} 个孤儿向量 ✅")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,13 @@
 """
-入库相关工具函数（分类等）
+ingest.py — 入库工具函数（已迁移至 classification.py）
 
-注：实际入库链路已统一由 engine.py（Stage 编排）+ ingest_stages.py（Stage 实现）驱动，
-本模块仅保留被复用的纯工具函数（如 _auto_classify），不再维护独立 ingest() 管道。
+本模块的 _auto_classify 和 _auto_folder 已迁移至 src.classification：
+  - classify_document(filename, text)  — 文档自动分类
+  - detect_document_folder(filename, text) — 发行系统文件夹识别
+
+保留此文件仅为向后兼容，新代码请直接 import src.classification。
 """
-import logging
+from src.classification import classify_document as _auto_classify
+from src.classification import detect_document_folder as _auto_folder
 
-from src.classification import classify_text
-
-logger = logging.getLogger("rag.pipeline")
-
-
-def _auto_classify(filename: str, text: str) -> str:
-    """简单关键词分类（统一走 classification.CATEGORY_DICT 权威词典）"""
-    return classify_text((filename or "") + " " + (text or "")[:2000])
+__all__ = ["_auto_classify", "_auto_folder"]

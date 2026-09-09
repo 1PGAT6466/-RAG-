@@ -51,7 +51,12 @@ def _get_collection():
 
 def add(chunk_id: int, embedding: bytes, content: str,
         file_id: int, chunk_index: int = 0) -> None:
-    """写入/更新一条向量"""
+    """写入/更新一条向量。
+
+    content 不再存入 Chroma metadata（避免 [:500] 截断导致长 chunk 精确命中/rerank 失效）。
+    检索后由 search._attach_file_names 从 chunks 主表按 id 回填完整 content。
+    见 MEMORY 检索/召回缺陷9。
+    """
     if not _use_chroma():
         return
     col = _get_collection()
@@ -59,23 +64,32 @@ def add(chunk_id: int, embedding: bytes, content: str,
     col.upsert(
         ids=[str(chunk_id)],
         embeddings=[vec.tolist()],
-        metadatas=[{"content": content[:500], "file_id": file_id,
-                    "chunk_index": chunk_index}],
+        metadatas=[{"file_id": file_id, "chunk_index": chunk_index}],
     )
 
 
+# Chroma HNSW 单次 upsert 的批次上限（Chroma 0.6.x 实测 max_batch_size 为 5461）。
+# 超过会抛 "Batch size N exceeds maximum batch size"，导致整批写入失败。
+# 用保守阈值分批，避免 ensure_synced / 入库 Stage 大批量补齐时一次超限全丢。
+_CHROMA_BATCH_LIMIT = 4000
+
+
 def add_batch(rows: list[tuple]) -> None:
-    """批量写入 [(chunk_id, embedding_bytes, content, file_id, chunk_index), ...]"""
+    """批量写入 [(chunk_id, embedding_bytes, content, file_id, chunk_index), ...]
+
+    内部按 _CHROMA_BATCH_LIMIT 分批 upsert，规避 Chroma HNSW max_batch_size 超限。
+    """
     if not _use_chroma():
         return
     if not rows:
         return
     col = _get_collection()
-    ids = [str(r[0]) for r in rows]
-    vecs = [_unpack(r[1]).tolist() for r in rows]
-    metas = [{"content": (r[2] or "")[:500], "file_id": r[3],
-              "chunk_index": r[4]} for r in rows]
-    col.upsert(ids=ids, embeddings=vecs, metadatas=metas)
+    for start in range(0, len(rows), _CHROMA_BATCH_LIMIT):
+        batch = rows[start:start + _CHROMA_BATCH_LIMIT]
+        ids = [str(r[0]) for r in batch]
+        vecs = [_unpack(r[1]).tolist() for r in batch]
+        metas = [{"file_id": r[3], "chunk_index": r[4]} for r in batch]
+        col.upsert(ids=ids, embeddings=vecs, metadatas=metas)
 
 
 def search(query_embedding: bytes, top_k: int = 30) -> list[dict]:
@@ -120,6 +134,27 @@ def delete(chunk_id: int) -> None:
     col.delete(ids=[str(chunk_id)])
 
 
+def delete_where(ids: list[str]) -> int:
+    """批量删除向量（一次调用，避免逐条 delete 触发 HNSW 重建卡死）
+
+    返回删除条数（Chroma delete 无返回值，传 id 不存在也不报错）。
+    ids 为空时直接返回 0（Chroma 对空 ids 会报错）。
+    """
+    if not _use_chroma():
+        return 0
+    ids = [str(i) for i in ids if str(i)]
+    if not ids:
+        return 0
+    col = _get_collection()
+    # 分批，避免超大列表一次 upsert/delete 超 HNSW 批上限（虽 delete 无严格上限，保守分批）
+    total = 0
+    for start in range(0, len(ids), _CHROMA_BATCH_LIMIT):
+        batch = ids[start:start + _CHROMA_BATCH_LIMIT]
+        col.delete(ids=batch)
+        total += len(batch)
+    return total
+
+
 def reset() -> None:
     """清空 collection（重建索引用）"""
     global _client, _collection
@@ -148,7 +183,7 @@ def ensure_synced() -> int:
         logger.warning(f"读取 Chroma 现有 id 失败: {e}")
         existing = set()
 
-    from src.storage.db import _get_conn
+    from src.storage.connection import _get_conn
     conn = _get_conn()
     rows = conn.execute(
         "SELECT id, file_id, chunk_index, content, embedding FROM chunks "

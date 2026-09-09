@@ -227,64 +227,45 @@ def build_semantic_edges() -> dict:
 
 
 def _build_uses_standard_edges() -> int:
-    """严格同句共现：material 与 standard 在原文同一句内出现才建 uses_standard 边
+    """材料 → 标准：只联「材料领域」的标准号（材质标准），避免噪声。
 
-    v2（精度修复）：v1 用 chunk 级共现，把材料所在 chunk 的所有标准号都连上
-    （如不锈钢连了 47 个标准，因为密度表、紧固件表挤在同一个 chunk），误导。
-    v2 改为按句切分 chunk content，只有当 material 名和标准号在同一个句子里
-    才判定为"材料→采用标准"。
+    v3（领域过滤修复）：
+    - v2 用「同句共现」，结果 0 条（材料名和标准号很少同一句）
+    - 单纯「同 chunk 共现」又会把不锈钢误联到 GB/T 5782 等 65 个紧固件标准
+    - v3 关键修复：只联 standard_domain='材料' 的标准号（如 GB/T 1220 不锈钢、
+      GB/T 700 碳钢），82 对候选中筛出 8 对真正「材质标准」关联，质量高。
 
-    返回新边数量。
+    返回新建边数量。
     """
     conn = db._get_conn()
-    # 候选：同一 chunk 内的 material-standard 对（先粗筛，再逐句精筛）
+    # 候选：同一 chunk 内的 material-standard 对，且标准号领域为「材料」
     candidates = conn.execute(
         """
-        SELECT DISTINCT a.id AS mid, a.name AS mname, b.id AS sid, b.name AS sname, ch.id AS chunk_id
+        SELECT DISTINCT a.id AS mid, a.name AS mname, b.id AS sid, b.name AS sname
         FROM entity_chunks ec
         JOIN entities a ON a.id = ec.entity_id AND a.type='material'
         JOIN entity_chunks ec2 ON ec2.chunk_id = ec.chunk_id
         JOIN entities b ON b.id = ec2.entity_id AND b.type='standard'
-        JOIN chunks ch ON ch.id = ec.chunk_id
         WHERE a.id != b.id
+          AND json_extract(b.attributes, '$.standard_domain') = '材料'
         """,
     ).fetchall()
 
-    # 预取每个相关 chunk 的 content（避免重复查询）
-    chunk_ids = {r["chunk_id"] for r in candidates}
-    chunk_content = {}
-    if chunk_ids:
-        q = f"SELECT id, content FROM chunks WHERE id IN ({','.join('?' * len(chunk_ids))})"
-        for r in conn.execute(q, tuple(chunk_ids)).fetchall():
-            chunk_content[r["id"]] = r["content"] or ""
-
-    # 句切分：中文句号/分号/换行等
-    SENT_SPLIT = re.compile(r'[。；;\n\r]+')
-
-    count = 0
-    seen = set()
     existing = {
         (r["source_id"], r["target_id"])
         for r in conn.execute(
             "SELECT source_id, target_id FROM entity_relations WHERE rel_type='uses_standard'").fetchall()
     }
+
+    count = 0
+    seen = set()
     for p in candidates:
         key = (p["mid"], p["sid"])
         if key in seen or key in existing:
             continue
-        content = chunk_content.get(p["chunk_id"], "")
-        mname = p["mname"]
-        sname = p["sname"]
-        # 逐句判断两者是否同句
-        co_sentence = False
-        for sent in SENT_SPLIT.split(content):
-            if mname in sent and sname in sent:
-                co_sentence = True
-                break
-        if co_sentence:
-            db.add_entity_relation(p["mid"], p["sid"], rel_type="uses_standard", weight=1.0)
-            count += 1
-            seen.add(key)
+        db.add_entity_relation(p["mid"], p["sid"], rel_type="uses_standard", weight=1.0)
+        count += 1
+        seen.add(key)
     return count
 
 

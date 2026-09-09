@@ -1,0 +1,46 @@
+# === 核心框架 ===
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# === HTTP ===
+httpx>=0.25.0
+
+# === 认证 ===
+PyJWT>=2.8.0
+bcrypt>=4.0.0
+
+# === 数据库 ===
+# SQLite 内置于 Python，无需额外安装
+chromadb>=0.4.0
+
+# === 中文分词 ===
+jieba>=0.42.0
+
+# === 向量化 / 嵌入 ===
+numpy>=1.24.0
+# sentence-transformers>=2.2.0  # 本地嵌入模型（取消注释启用本地 embedding）
+
+# === 文档解析 ===
+PyMuPDF>=1.23.0     # PDF 解析（import fitz）
+python-pptx>=0.6.21 # PPTX 解析
+openpyxl>=3.1.0     # XLSX 解析
+python-docx>=1.0.0  # DOCX 解析
+
+# === OCR（可选，扫描件 PDF） ===
+# rapidocr>=1.3.0   # PP-OCRv6，按需安装
+# rapidocr_onnxruntime  # PP-OCRv4 回退，按需安装
+
+# === MCP 客户端（Smithery 市场） ===
+# mcp 2.0+ 使用 httpx2 替换 httpx，导致项目全部 HTTP 调用崩溃
+# 必须 pin <2.0.0，该版本依赖原生 httpx，无冲突
+mcp>=1.0.0,<2.0.0
+
+# === 联网搜索（可选） ===
+# requests>=2.31.0  # smoke_test.py 使用，按需安装
+
+# === 测试 ===
+pytest>=7.0.0
+pytest-cov>=4.0.0
+opencc-python-reimplemented>=0.1.7

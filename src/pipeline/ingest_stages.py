@@ -19,7 +19,7 @@ ingest_stages.py — 引擎内置 Stage 实现
 """
 import logging
 import os
-from config import UPLOAD_DIR, RAG_ENTITY_EXTRACT, RAG_ENTITY_LLM, RAG_AUTO_SUMMARY, RAG_AUTO_TAG, RAG_AUTO_PREINDEX, RAG_AUTO_SEMANTIC, RAG_AUTO_DOC_SIM
+from config import UPLOAD_DIR, RAG_ENTITY_EXTRACT, RAG_ENTITY_LLM, RAG_AUTO_SUMMARY, RAG_AUTO_TAG, RAG_AUTO_PREINDEX, RAG_AUTO_SEMANTIC, RAG_AUTO_DOC_SIM, RAG_IMAGE_EXTRACT
 
 from . import engine
 
@@ -43,10 +43,12 @@ def _stage_parse(ctx: dict):
 
 @engine.register_stage("chunk", stage_type="sync")
 def _stage_chunk(ctx: dict):
-    from .chunker import chunk_text
+    from .chunker import chunk_text, clean_chunks
     chunks = chunk_text(ctx["text"], source_name=ctx["filename"])
     if not chunks:
         raise ValueError("分块后无有效内容")
+    # 清洗层显式化：切块（chunk_text）与语言清洗（clean_chunks）解耦
+    chunks = clean_chunks(chunks)
     ctx["chunks"] = chunks
     ctx["chunk_count"] = len(chunks)
 
@@ -77,7 +79,7 @@ def _stage_store(ctx: dict):
     )
     batch = [
         (file_id, c["index"], c["content"], ctx["token_counts"][i], ctx["embeddings"][i],
-         {"heading": c["heading"], "source": c["source"]})
+         {"heading": c["heading"], "source": c["source"], "markdown": bool(c.get("markdown"))})
         for i, c in enumerate(chunks)
     ]
     chunk_ids = add_chunks_batch(batch)
@@ -99,12 +101,27 @@ def _stage_store(ctx: dict):
 
 @engine.register_stage("classify", stage_type="sync")
 def _stage_classify(ctx: dict):
-    from .ingest import _auto_classify
-    from src.storage.db import update_file_category
-    cat = _auto_classify(ctx["filename"], ctx["text"])
-    if cat != "未分类":
-        update_file_category(ctx["file_id"], cat)
+    from src.classification import classify_document, detect_document_folder, detect_doc_meta
+    from src.storage.db import update_file_category, update_file_folder, update_file_doc_meta
+    cat = classify_document(ctx["filename"], ctx["text"])
     ctx["category"] = cat
+    file_id = ctx.get("file_id")
+    if not file_id:
+        return
+    if cat != "未分类":
+        update_file_category(file_id, cat)
+
+    # 操作手册按发行系统自动建虚拟文件夹（如 /泛微OA），实现分系统归类
+    folder = detect_document_folder(ctx["filename"], ctx["text"])
+    if folder:
+        update_file_folder(ctx["file_id"], folder)
+        ctx["folder"] = folder
+
+    # 元数据层：文档类型 + 权威等级（专属化检索精准度，见方案文档）
+    doc_kind, authority = detect_doc_meta(ctx["filename"], cat, ctx["text"])
+    update_file_doc_meta(file_id, doc_kind, authority)
+    ctx["doc_kind"] = doc_kind
+    ctx["authority"] = authority
 
 
 @engine.register_stage("extract", stage_type="sync")
@@ -132,44 +149,10 @@ def _stage_extract(ctx: dict):
 # 异步 Stage（LLM 密集，后台执行）
 # ============================================================
 def _llm_chat(text: str, system: str, max_tokens: int = 1024, prefer_deepseek: bool = False) -> str:
-    """同步 LLM 调用（供后台线程用）
-
-    prefer_deepseek=True 时优先 DeepSeek（非推理模型，结构化输出稳定），
-    因为 MiMo 是推理模型，reasoning_content 会抢占 max_tokens 导致 content 被截断。
-    """
-    import httpx
-    from config import MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, \
-        DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_FLASH_MODEL, DEEPSEEK_TIMEOUT
+    """同步 LLM 调用（供后台线程用），委托 src.llm。"""
+    from src.llm import call_llm_sync
     messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
-
-    providers = []
-    if prefer_deepseek:
-        # 结构化输出（摘要/标签/预索引）优先 flash（非推理、快、稳），回退 pro
-        providers.append(("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL))
-        providers.append(("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
-        providers.append(("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL))
-    else:
-        providers.append(("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL))
-        providers.append(("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL))
-
-    for name, base, key, model in providers:
-        # 每个 provider 试两次，应对 reasoning 模型偶发空返回
-        for attempt in range(2):
-            try:
-                with httpx.Client(timeout=120) as client:
-                    resp = client.post(
-                        f"{base}/chat/completions",
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0.2},
-                    )
-                    resp.raise_for_status()
-                    content = resp.json()["choices"][0]["message"].get("content") or ""
-                    if content.strip():
-                        return content
-                    logger.warning(f"{name} 返回空 content（第{attempt+1}次），重试")
-            except Exception as e:
-                logger.warning(f"{name} 调用失败（第{attempt+1}次）: {e}")
-    return ""
+    return call_llm_sync(messages, max_tokens=max_tokens, prefer_mimo=not prefer_deepseek)
 
 
 def _doc_head(ctx: dict, limit: int = 8000) -> str:
@@ -180,9 +163,47 @@ def _doc_head(ctx: dict, limit: int = 8000) -> str:
 
 @engine.register_stage("summarize", stage_type="async")
 def _stage_summarize(ctx: dict):
+    """文档摘要 + 标签 —— 合并为一次 LLM 调用（LLM 减负：原本 2 次→1 次）
+
+    若 RAG_AUTO_TAG 开启，则一次调用产出 JSON {summary, tags}，避免再单独调 tag stage。
+    """
     if RAG_AUTO_SUMMARY != "1":
         return
     head = _doc_head(ctx)
+
+    want_tags = RAG_AUTO_TAG == "1"
+    if want_tags:
+        prompt = (
+            '请分析以下工业文档，输出一个 JSON 对象，格式为 '
+            '{"summary": "3-5句话切要说明，突出标准/材料/工艺/关键参数", '
+            '"tags": ["5-8个主题标签"]}，只输出 JSON 不要其他内容：\n\n'
+            f'{head}'
+        )
+        raw = _llm_chat(prompt, "你是工业文档摘要与打标助手，只输出一个 JSON 对象。",
+                        max_tokens=1024, prefer_deepseek=True)
+        import json
+        summary, tags = '', []
+        try:
+            from src.llm import extract_json
+            data = extract_json(raw, expect="object") or {}
+            summary = (data.get("summary") or "").strip()
+            tags = [t for t in (data.get("tags") or []) if isinstance(t, str)][:8]
+        except Exception:
+            summary = raw.strip()
+        ctx["summary"] = summary
+        ctx["tags"] = tags
+        try:
+            from src.storage import db
+            if summary and hasattr(db, "update_file_summary"):
+                db.update_file_summary(ctx["file_id"], summary)
+            if tags and hasattr(db, "update_file_tags"):
+                db.update_file_tags(ctx["file_id"], tags)
+        except Exception:
+            pass
+        logger.info(f"文件 {ctx.get('file_id')} 摘要+标签合并生成完成({len(tags)} 标签)")
+        return
+
+    # tag 关闭：仅出摘要
     summary = _llm_chat(
         f"请用 3-5 句话概括以下工业文档的核心内容，突出涉及的标准、材料、工艺和关键参数：\n\n{head}",
         "你是工业文档摘要助手，输出精炼摘要。",
@@ -204,6 +225,11 @@ def _stage_summarize(ctx: dict):
 def _stage_tag(ctx: dict):
     if RAG_AUTO_TAG != "1":
         return
+    # tags 已由 summarize 合并产出，则不再单独调 LLM（避免重复调用）
+    if ctx.get("tags"):
+        logger.debug(f"文件 {ctx.get('file_id')} 标签已由 summarize 合并产出，跳过")
+        return
+    # 兑底：summarize 关闭但 tag 开启时，单独打标
     head = _doc_head(ctx, 4000)
     raw = _llm_chat(
         f"从以下工业文档提炼 5-8 个主题标签，用 JSON 数组格式输出，不要输出其他内容：\n\n{head}",
@@ -231,6 +257,13 @@ def _stage_tag(ctx: dict):
 @engine.register_stage("preindex", stage_type="async")
 def _stage_preindex(ctx: dict):
     if RAG_AUTO_PREINDEX != "1":
+        return
+    # 按文档类型条件触发：操作手册/OA 办公文档不预生成问答（它们偏流程指引，
+    # 预设的「标准/材料/工艺/参数」四问对 OA 手册基本无效，纯浪费 LLM 调用）。
+    # 仅工业技术文档（连接器/材料/标准/工艺等）才 preindex。
+    cat = ctx.get("category") or ""
+    if cat == "操作手册":
+        logger.info(f"文件 {ctx.get('file_id')} 为操作手册（{cat}），跳过 preindex")
         return
     head = _doc_head(ctx, 6000)
     questions = [
@@ -283,3 +316,31 @@ def _stage_docsim(ctx: dict):
         logger.info(f"文件 {file_id} 文档相似度边构建完成: {count} 条")
     except Exception as e:
         logger.warning(f"文档相似度边构建失败（已忽略）: {e}")
+
+
+@engine.register_stage("images", stage_type="async")
+def _stage_images(ctx: dict):
+    """图片提取：从原始文件提取内嵌图片，支撑可读模式 ![[图]] 显示
+
+    查看层增强，不影响检索。失败降级（跳过），不阻断。
+    """
+    if RAG_IMAGE_EXTRACT != "1":
+        return
+    try:
+        from config import IMAGES_DIR
+        from .image_extractor import extract_images
+        from src.storage import db
+        file_id = ctx.get("file_id")
+        target = ctx.get("target_path") or ctx.get("filepath")
+        if not file_id or not target:
+            return
+        # 幂等：已有图片就不再重复提取
+        if db.count_images(file_id) > 0:
+            logger.info(f"文件 {file_id} 已有图片记录，跳过提取")
+            return
+        imgs = extract_images(str(target), file_id, IMAGES_DIR)
+        if imgs:
+            n = db.add_images(file_id, imgs)
+            logger.info(f"文件 {file_id} 图片提取完成: {n} 张")
+    except Exception as e:
+        logger.warning(f"图片提取失败（已忽略）: {e}")

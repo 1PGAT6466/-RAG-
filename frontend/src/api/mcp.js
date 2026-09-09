@@ -1,9 +1,9 @@
 import api from './index'
 
 export default {
-  // 浏览市场（Smithery registry）
-  market(query = '', limit = 50) {
-    return api.get('/mcp/market', { params: { q: query, limit } })
+  // 浏览市场（Smithery registry，支持服务端搜索 + 分页）
+  market(query = '', page = 1, pageSize = 20) {
+    return api.get('/mcp/market', { params: { q: query, page, page_size: pageSize } })
   },
   // 已安装列表
   installed() {

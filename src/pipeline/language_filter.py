@@ -17,6 +17,9 @@ from config import RAG_LANG_FILTER
 
 logger = logging.getLogger("rag.langfilter")
 
+# OpenCC 惰性单例（首次 normalize_han 时加载；False 表示已尝试但不可用）
+_opencc_instance = None
+
 # ============ 高置信度繁简映射表 ============
 # 只收录「一对一、无歧义」的繁→简映射。
 # 故意排除歧义字（一简多繁），以及涉及异体/地域用字差异的字。
@@ -102,14 +105,62 @@ def _han_ratio(text: str) -> float:
     return han / max(len(text), 1)
 
 
+def _get_opencc():
+    """惰性加载 OpenCC t2s 转换器（标准权威映射，覆盖工业高频字如 鑑锤锌锡钼等）。
+    安装失败时返回 None，调用方降级到手工映射表 _SAFE_TC_TO_SC。"""
+    global _opencc_instance
+    if _opencc_instance is None:
+        try:
+            from opencc import OpenCC
+            _opencc_instance = OpenCC('t2s')
+            logger.info("繁转简引擎：OpenCC (t2s)")
+        except ImportError:
+            logger.warning("OpenCC 未安装，繁转简回退到高置信度手工映射表（工业字覆盖不全）")
+            _opencc_instance = False  # 标记已尝试且不可用
+    return _opencc_instance if _opencc_instance is not False else None
+
+
+# ============ 歧义繁体字保护集 ============
+# 一简多繁的歧义字：同一简体对应多个繁体（干→乾/幹、发→髮/發、后→後 等），
+# OpenCC t2s 会给它们一个默认转换，但无法 100% 确定原字本意，
+# 故按「不 100% 确定就不转」原则保留原文（不转换）。
+_AMBIGUOUS_TC = set(
+    "乾幹髮發後裏裡麵臺颱檯颳鬆隻鬥復複徵鐘鍾範范餘余匯彙係系彷彿彷佛"
+)
+
+
 def normalize_han(text: str) -> str:
     """
-    高置信度繁→简转换。
-    只转换 _SAFE_TC_TO_SC 中的无歧义映射；其余（含歧义字）保留原文。
+    繁→简转换。
+    优先用 OpenCC（标准映射，完整覆盖工业金属/化学/技术术语）；
+    但歧义繁体字（一简多繁，如 乾/幹、髮/發、後）用占位符保护、转换后还原，
+    保留原文，符合「不 100% 确定就不转」原则。
+    OpenCC 不可用时降级到高置信度手工映射 _SAFE_TC_TO_SC（保守、覆盖不全）。
     返回转换后的文本。
     """
     if not text:
         return text
+    cc = _get_opencc()
+    if cc is not None:
+        try:
+            # 1. 把歧义繁体字替换成唯一占位符，避免被 OpenCC 误转
+            protected = {}
+            buf = []
+            for ch in text:
+                if ch in _AMBIGUOUS_TC:
+                    token = f"\ue000{len(protected)}\ue001"  # 私用区占位符
+                    protected[token] = ch
+                    buf.append(token)
+                else:
+                    buf.append(ch)
+            # 2. OpenCC 转换（占位符不受影响）
+            converted = cc.convert("".join(buf))
+            # 3. 还原占位符 → 原歧义繁体字
+            for token, orig in protected.items():
+                converted = converted.replace(token, orig)
+            return converted
+        except Exception as e:
+            logger.warning(f"OpenCC 转换失败（回退手工映射）: {e}")
     return ''.join(_SAFE_TC_TO_SC.get(ch, ch) for ch in text)
 
 
@@ -140,11 +191,20 @@ def should_drop_chunk(content: str) -> bool:
     判断一个 chunk 是否应整体丢弃（非中文为主的内容）。
     规则：汉字占比 < 0.3 且长度 > 50 时，判定为「非中文内容」丢弃。
     （英文长句、乱码段、纯符号段会被丢弃；短型号串因长度不达标会保留）
+
+    豁免规则（2026-08-26 修复表格数据误杀）：
+      中英混排的表格型数据（采购单/料表），每行大量品号/规格/订单号/日期是
+      ASCII/数字，把汉字占比稀释到 <0.3，但其「品名/供应商/采购员」等列含
+      明确的中文语义（连续汉字词）。此时保留 chunk，避免合法中文数据被误丢。
+      实现：若文本含「连续 ≥2 字中文词」，视为有中文语义，不丢弃。
     """
     if not RAG_LANG_FILTER or not content:
         return False
     text = content.strip()
     if len(text) <= 50:
+        return False
+    # 豁免：含连续中文词（≥2字）的中英混排表格数据，保留
+    if re.search(r'[\u4e00-\u9fff]{2,}', text):
         return False
     return _han_ratio(text) < 0.3
 

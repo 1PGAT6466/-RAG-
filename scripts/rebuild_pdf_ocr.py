@@ -211,7 +211,7 @@ def _rebuild(file_id: int, pdf_path: str, workers: int, dpi: int,
     """OCR 重建主体：先 OCR（可断点），成功后才清库重建——中途失败旧数据不受影响"""
     import fitz
     from src.storage import db
-    from src.pipeline.chunker import chunk_text
+    from src.pipeline.chunker import chunk_text, clean_chunks
     from src.pipeline.embedder import encode
 
     cpu_count = os.cpu_count() or 16
@@ -241,10 +241,14 @@ def _rebuild(file_id: int, pdf_path: str, workers: int, dpi: int,
     # 2. 清理旧数据
     _clean_file_data(file_id)
 
-    # 3. 分块
+    # 3. 分块 + 清洗（与入库链路的 chunk→clean 两段解耦保持一致）
     chunks = chunk_text(text, source_name=f["name"])
     if not chunks:
         logger.error("分块后无内容")
+        return
+    chunks = clean_chunks(chunks)
+    if not chunks:
+        logger.error("清洗后无内容")
         return
     logger.info(f"分块: {len(chunks)} 块")
 

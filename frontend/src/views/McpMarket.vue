@@ -2,8 +2,8 @@
   <div class="mcp-page">
     <div class="page-header">
       <div>
-        <h2 class="page-title">MCP 市场</h2>
-        <p class="page-sub">浏览并安装标准化 MCP server，扩展知识库能力</p>
+        <h2 class="page-title"><el-icon><Shop /></el-icon>MCP 市场</h2>
+        <p class="page-subtitle">浏览并安装标准化 MCP server，扩展知识库能力</p>
       </div>
       <el-tag v-if="!auth.isAdmin" type="info" size="small">仅管理员可安装/卸载</el-tag>
     </div>
@@ -24,12 +24,12 @@
           placeholder="搜索 MCP server（名称/描述）"
           clearable
           size="large"
-          @keyup.enter="loadMarket"
-          @clear="loadMarket"
+          @keyup.enter="doSearch"
+          @clear="doSearch"
         >
           <template #prefix><el-icon><Search /></el-icon></template>
           <template #append>
-            <el-button @click="loadMarket">搜索</el-button>
+            <el-button @click="doSearch">搜索</el-button>
           </template>
         </el-input>
       </div>
@@ -57,6 +57,9 @@
           </div>
           <p class="card-desc">{{ s.description || '暂无描述' }}</p>
           <div class="card-meta">
+            <el-tag v-if="s.relevance" type="warning" size="small" effect="light">
+              相关度 {{ s.relevance }}
+            </el-tag>
             <span v-if="s.useCount"><el-icon><User /></el-icon> {{ s.useCount }}</span>
             <span v-if="s.homepage">{{ shortUrl(s.homepage) }}</span>
           </div>
@@ -76,6 +79,19 @@
       </div>
 
       <el-empty v-if="!marketLoading && market.length === 0" description="未找到 MCP server（可能是 registry 暂时不可用）" />
+
+      <!-- 分页 -->
+      <div v-if="total > 0" class="market-pagination">
+        <span class="pagination-total">共 {{ total }} 个</span>
+        <el-pagination
+          background
+          layout="prev, pager, next"
+          :current-page="page"
+          :page-size="pageSize"
+          :total="total"
+          @current-change="changePage"
+        />
+      </div>
     </div>
 
     <!-- ============ 已安装 ============ -->
@@ -124,8 +140,8 @@
         <el-form-item label="完整标识">
           <el-input v-model="installForm.qualifiedName" placeholder="如 @smithery-ai/server-sequential-thinking" />
         </el-form-item>
-        <el-form-item label="启动命令" required>
-          <el-input v-model="installForm.command" placeholder="如 npx / node / python" />
+        <el-form-item label="启动命令">
+          <el-input v-model="installForm.command" placeholder="留空则由系统自动判断（远程 server 走 HTTP 直连；本地 server 才需填 npx/node/python）" />
         </el-form-item>
         <el-form-item label="命令参数">
           <el-input v-model="installForm.argsText" placeholder="空格分隔，如 -y @modelcontextprotocol/server-filesystem" />
@@ -164,7 +180,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import mcpApi from '../api/mcp'
 
@@ -176,6 +192,17 @@ const keyword = ref('')
 const market = ref([])
 const marketLoading = ref(false)
 const marketError = ref('')
+// 分页
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
+const totalPages = ref(0)
+// 后台补译后自动刷新（避免翻页干等 LLM）
+let pendingTimer = null
+// 组件卸载时清理 pendingTimer（防止切走页面后仍在后台轮询）
+onUnmounted(() => {
+  if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null }
+})
 
 // 已安装
 const installed = ref([])
@@ -221,13 +248,48 @@ async function loadMarket() {
   marketLoading.value = true
   marketError.value = ''
   try {
-    const { data } = await mcpApi.market(keyword.value)
-    market.value = data.data || []
+    const { data } = await mcpApi.market(keyword.value, page.value, pageSize.value)
+    const payload = data.data || {}
+    market.value = payload.servers || []
+    total.value = payload.total || 0
+    totalPages.value = payload.total_pages || 0
+
+    // 有未翻译项：先渲染（英文原文），后台补译完成后静默刷新一遍
+    if (payload.pending_translate) {
+      schedulePendingRefresh()
+    }
   } catch (e) {
     marketError.value = '市场加载失败：' + (e.response?.data?.detail || e.message)
   } finally {
     marketLoading.value = false
   }
+}
+
+function schedulePendingRefresh() {
+  if (pendingTimer) clearTimeout(pendingTimer)
+  pendingTimer = setTimeout(async () => {
+    // 静默刷新当前页（不入 loading 态，避免闪烁）；此时后台已写完缓存，命中即中文
+    try {
+      const { data } = await mcpApi.market(keyword.value, page.value, pageSize.value)
+      market.value = data.data || []
+      total.value = data.total || 0
+      totalPages.value = data.total_pages || 0
+      // 若后台翻译还没跑完，再排一次（防御 LLM 较慢）
+      if (data.pending_translate) schedulePendingRefresh()
+    } catch (e) { /* 静默失败 */ }
+  }, 3500)
+}
+
+// 搜索：重置到第 1 页
+function doSearch() {
+  page.value = 1
+  loadMarket()
+}
+
+// 翻页
+function changePage(p) {
+  page.value = p
+  loadMarket()
 }
 
 async function loadInstalled() {
@@ -254,11 +316,13 @@ function openInstall(s) {
 }
 
 async function doInstall() {
-  if (!installForm.value.command.trim()) {
-    return
-  }
   installing.value = true
   try {
+    let transport = 'auto'
+    // 若用户填了启动命令，走本地 stdio；否则 auto（由后端判 remote http）
+    if (installForm.value.command.trim()) {
+      transport = 'stdio'
+    }
     const args = installForm.value.argsText.trim()
       ? installForm.value.argsText.trim().split(/\s+/)
       : []
@@ -273,20 +337,24 @@ async function doInstall() {
       qualifiedName: installForm.value.qualifiedName,
       command: installForm.value.command.trim(),
       args,
-      env
+      env,
+      transport
     })
     installVisible.value = false
     await loadInstalled()
     tab.value = 'installed'
   } catch (e) {
     console.error('安装失败', e)
-    this.$message?.error?.('安装失败')
+    ElMessage.error('安装失败：' + (e.response?.data?.detail || e.message))
   } finally {
     installing.value = false
   }
 }
 
 async function doUninstall(s) {
+  try {
+    await ElMessageBox.confirm(`确认卸载 MCP server「${s.displayName || s.qualifiedName}」？`, '卸载确认', { type: 'warning', confirmButtonText: '卸载', cancelButtonText: '取消' })
+  } catch { return }
   try {
     await mcpApi.uninstall(s.qualifiedName)
     if (expandedQn.value === s.qualifiedName) expandedQn.value = ''
@@ -383,13 +451,15 @@ onMounted(() => {
 }
 .page-title {
   margin: 0 0 4px;
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 700;
 }
-.page-sub {
+.page-subtitle {
   margin: 0;
-  font-size: 13px;
-  color: var(--text-tertiary, #999);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  letter-spacing: 0.3px;
 }
 .mcp-tabs {
   margin-bottom: 20px;
@@ -402,6 +472,19 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+}
+.market-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border, #e5e5e5);
+}
+.pagination-total {
+  font-size: 13px;
+  color: var(--text-tertiary, #999);
 }
 .market-card,
 .installed-card {

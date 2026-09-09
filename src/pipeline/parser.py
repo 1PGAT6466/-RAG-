@@ -7,23 +7,22 @@ from config import RAG_PDF_OCR
 
 logger = logging.getLogger("rag.parser")
 
+# 双栏判定最小 x 跨度（经验值，实测手册双栏跨宽 > 250pt，单栏 < 150pt）
+_MULTI_COL_MIN_SPAN = 220.0
+
 
 def parse_file(filepath: str) -> str:
-    """根据扩展名分发到对应解析器，返回纯文本"""
-    ext = Path(filepath).suffix.lower()
-    parsers = {
-        ".pdf": _parse_pdf,
-        ".ppt": _parse_ppt,
-        ".pptx": _parse_pptx,
-        ".xlsx": _parse_xlsx,
-        ".xls": _parse_xlsx,
-        ".docx": _parse_docx,
-        ".txt": _parse_txt,
-        ".md": _parse_txt,
-    }
-    parser = parsers.get(ext, _parse_txt)
-    logger.info(f"解析 [{ext}]: {filepath}")
-    return parser(filepath)
+    """根据扩展名分发到对应 backend，返回纯文本。
+
+    分发逻辑抽到 src/pipeline/backends.py（对标 MinerU/docling 的 backend 抽象），
+    此处只做「取 backend → 调 parse」。未知扩展名统一走 TextBackend（含二进制嗅探）。
+    """
+    p = Path(filepath)
+    ext = p.suffix.lower()
+    from .backends import get_backend
+    backend = get_backend(ext)
+    logger.info(f"解析 [{ext or '无扩展名'}]: {filepath} (backend={backend.__name__})")
+    return backend().parse(filepath)
 
 
 def _parse_pdf(filepath: str) -> str:
@@ -39,6 +38,20 @@ def _parse_pdf(filepath: str) -> str:
       - auto ：默认，文本层提取 + 自动检测，乱码/扫描件自动转 OCR
     """
     mode = RAG_PDF_OCR
+    # 深度解析增强（可选）：开启 flag 时，优先用 MinerU 对复杂 PDF 做结构化抽取；
+    #   MinerU 未安装/失败/产出过短时，自动降级回下面的 fitz+OCR 主链路（零影响）。
+    try:
+        from config import RAG_PDF_DEEP_PARSE
+        if RAG_PDF_DEEP_PARSE == "1":
+            from .deep_parse import deep_parse_pdf
+            deep_text = deep_parse_pdf(filepath)
+            if deep_text and len(deep_text.strip()) > 200:
+                logger.info(f"MinerU 深度解析成功: {len(deep_text)} 字")
+                return deep_text
+            logger.info("MinerU 深度解析未产出有效文本，降级回 fitz+OCR")
+    except Exception as e:
+        logger.debug(f"深度解析前置检查跳过: {e}")
+
     if mode == "force":
         ocr_text = _parse_pdf_ocr(filepath)
         if ocr_text and len(ocr_text.strip()) > 100:
@@ -47,17 +60,20 @@ def _parse_pdf(filepath: str) -> str:
         return _extract_pdf_text(filepath)
 
     # 默认 auto：文本层提取 + 质量检测
+    import io
     import fitz
     with fitz.open(filepath) as doc:
         n = len(doc)
-        texts = []
+        buf = io.StringIO()
         for i, page in enumerate(doc):
-            t = page.get_text()
+            t = _page_text_reflowed(page)
             if t:
-                texts.append(t)
+                if i > 0:
+                    buf.write("\n\n")
+                buf.write(t)
             if (i + 1) % 200 == 0:
                 logger.info(f"  ...{i + 1}/{n} 页")
-    text = "\n\n".join(texts)
+    text = buf.getvalue()
 
     # 检测 1：扫描件（文本层几乎为空）
     if n > 0 and len(text.strip()) < n * 30:
@@ -106,6 +122,45 @@ def _text_garbled_check(text: str) -> bool:
     logger.info(f"乱码检测：抽样 {len(ratios)} 段，低簇中位={low_median:.3f}（阈值 0.45），"
                 f"全文中位={ratios[len(ratios)//2]:.3f}")
     return low_median < 0.45
+
+
+def _page_text_reflowed(page) -> str:
+    """逐页提取文本：单栏用 fitz 默认序，双栏自动重排（左栏先、右栏后）。
+
+    只影响解析内部实现，不改变 _parse_pdf 对外行为（仍返回纯文本字符串）。
+
+    双栏判定（基于文本块坐标，无新依赖）：连续文本块的 x 起点差异 > 错跨栏阈值，
+    且左右两栏都有足够块数，判定为双栏，按 (行 y, 栏 x) 重排；否则回退 fitz 默认
+    get_text() 的阅读序（单栏页不受影响）。
+
+    实测（非标准机械设计手册.pdf，1423 页，抽前 200 页）：
+      54.5% 清晰多栏、28.5% 乱码、13.5% 清晰单栏、3.5% 空页。
+    该重排只作用于「清晰双栏」页，其余页行为不变。
+    """
+    import fitz
+
+    # 文本块（b[4] 为文本，过滤空块）
+    blocks = [b for b in page.get_text("blocks") if (b[4] or "").strip()]
+    if not blocks:
+        return page.get_text()
+
+    # 双栏判定：x 起点跨度 > 阈值，且左右两栏块数都 > 1
+    xs = [b[0] for b in blocks]
+    x_span = max(xs) - min(xs)
+    if x_span < _MULTI_COL_MIN_SPAN or len(blocks) < 4:
+        return page.get_text()
+
+    mid_x = (min(xs) + max(xs)) / 2
+    left = [b for b in blocks if b[0] < mid_x]
+    right = [b for b in blocks if b[0] >= mid_x]
+    if len(left) < 2 or len(right) < 2:
+        return page.get_text()
+
+    # 双栏重排：左栏按 y 排，再右栏按 y 排（各栏内保持垂直阅读序）
+    left.sort(key=lambda b: (b[1], b[0]))
+    right.sort(key=lambda b: (b[1], b[0]))
+    ordered = left + right
+    return "\n".join(b[4].strip() for b in ordered if b[4].strip())
 
 
 def _extract_pdf_text(filepath: str) -> str:
@@ -210,8 +265,8 @@ def _parse_ppt(filepath: str) -> str:
             import glob
             pdfs = list(glob.glob(os.path.join(out_dir, "*.pdf")))
             if pdfs:
-                from .parser import _parse_pdf
-                return _parse_pdf(pdfs[0])
+                from . import parser as _parser
+                return _parser._parse_pdf(pdfs[0])
         except Exception as e:
             logger.error(f"LibreOffice 转换失败: {e}")
         finally:
@@ -270,7 +325,68 @@ def _parse_ppt(filepath: str) -> str:
     except Exception as e:
         logger.error(f"PPT OLE 提取失败: {e}")
 
-    return f"[文件: {Path(filepath).name}] 旧版 .ppt 格式不支持直接解析，请用 PowerPoint 另存为 PDF 后重新上传。"
+    # 不返回占位提示串（历史坑：提示串 >50 字会当正文入库污染向量库）。
+    # 改为抛异常，让 _stage_parse 显式标记该文件解析失败，而非伪装成成功。
+    raise ValueError(f"旧版 .ppt 格式无法解析（缺 LibreOffice），请另存为 PDF 后重新上传: {Path(filepath).name}")
+
+
+def _parse_xls(filepath: str) -> str:
+    """旧版 .xls (OLE/BIFF) — openpyxl 不支持，用 xlrd 解析；无 xlrd 时用 LibreOffice 转 xlsx。
+
+    历史坑：旧版 .xls/.xlsx 共用 openpyxl，导致 .xls 一上传就抛 InvalidFileException 直接失败。
+    """
+    # 首选 xlrd（旧版 .xls 专用，读值快）
+    try:
+        import xlrd
+        wb = xlrd.open_workbook(filepath)
+        texts = []
+        for sheet in wb.sheets():
+            texts.append(f"## {sheet.name}")
+            for r in range(sheet.nrows):
+                row_vals = []
+                for c in range(sheet.ncols):
+                    cell = sheet.cell_value(r, c)
+                    # 数值转字符串，去掉浮点尾零
+                    if isinstance(cell, float):
+                        cell = (f"{cell:g}")
+                    row_vals.append(str(cell).strip())
+                row_text = "\t".join(row_vals).strip()
+                if row_text:
+                    texts.append(row_text)
+        return "\n".join(texts)
+    except ImportError:
+        logger.warning("xlrd 未安装，xls 回退 LibreOffice 转换")
+    except Exception as e:
+        logger.warning(f"xlrd 解析 xls 失败，回退 LibreOffice: {e}")
+
+    # 回退 LibreOffice 转 xlsx
+    try:
+        import subprocess, tempfile, os, glob
+        lo_paths = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "soffice", "libreoffice",
+        ]
+        soffice = None
+        for p in lo_paths:
+            if os.path.exists(p) or subprocess.run(["where", p], capture_output=True).returncode == 0:
+                soffice = p
+                break
+        if soffice:
+            out_dir = tempfile.mkdtemp()
+            try:
+                subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", out_dir, filepath],
+                               capture_output=True, timeout=120)
+                xlsx = glob.glob(os.path.join(out_dir, "*.xlsx"))
+                if xlsx:
+                    return _parse_xlsx(xlsx[0])
+            finally:
+                import shutil
+                shutil.rmtree(out_dir, ignore_errors=True)
+    except Exception as e:
+        logger.error(f"xls LibreOffice 转换失败: {e}")
+
+    raise ValueError(f"旧版 .xls 无法解析（缺 xlrd 与 LibreOffice）: {Path(filepath).name}")
 
 
 def _parse_xlsx(filepath: str) -> str:
@@ -311,13 +427,87 @@ def _parse_xlsx(filepath: str) -> str:
 
 def _parse_docx(filepath: str) -> str:
     from docx import Document as DocxDocument
+    from docx.document import Document as _Doc
+    from docx.table import Table as _Table
+    from docx.text.paragraph import Paragraph as _Para
     doc = DocxDocument(filepath)
+
+    # 按文档顺序遍历 body 顶层元素（段落 + 表格），保留表格行列结构。
+    # 历史坑：只读 doc.paragraphs 会跳过 doc.tables（工业规格书关键数据都在表格里）。
+    parts = []
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith('}p'):
+            # 段落
+            p = _Para(child, doc)
+            t = p.text.strip()
+            if t:
+                parts.append(t)
+        elif child.tag.endswith('}tbl'):
+            # 表格 → markdown 表格文本（保留每行每列）
+            tbl = _Table(child, doc)
+            rows = []
+            for row in tbl.rows:
+                cells = [c.text.strip().replace('\n', ' ') for c in row.cells]
+                rows.append(' | '.join(cells))
+            if rows:
+                # 加表头分隔线，便于下游识别表格结构
+                header_sep = ' | '.join(['---'] * len(tbl.rows[0].cells))
+                parts.append('\n'.join([rows[0], header_sep] + rows[1:]))
+    if parts:
+        return "\n\n".join(parts)
+    # 兑底：无 body 元素时回退纯段落
     return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
 def _parse_txt(filepath: str) -> str:
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        return f.read()
+    """带多编码探测的文本读取（utf-8 → gb18030 → utf-16）。
+
+    历史坑：硬编码 utf-8 + errors=replace 会把 GBK/GB2312 中文替换成乱码且不可挽回。
+    """
+    raw = None
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    if not raw:
+        return ""
+
+    for enc in ("utf-8", "gb18030", "utf-16"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    # 兑底：强解 utf-8，无法解码的替换（罕见场景）
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_csv(filepath: str) -> str:
+    """CSV 结构化解析：保留列头 + 每行“列名=值”语义，避免落为无结构纯文本。
+
+    历史坑：CSV 走 _parse_txt 纯文本整读，行列结构丢失，大片表格被硬切成碎片。
+    """
+    import csv
+    text = _parse_txt(filepath)
+    # 用 csv 模块按行解析（保留引号内逗号），sniff 自动识别分隔符/引号
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=',\t;|')
+    except Exception:
+        dialect = csv.excel
+
+    reader = csv.reader(text.splitlines(), dialect)
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        return text
+
+    # 首行作为表头（若无表头语义则整行拼接）
+    header = [h.strip() for h in rows[0]]
+    lines = ["\t".join(header)]
+    for r in rows[1:]:
+        # 列名=值 拼接，保留字段语义；行内照旧可以用 tab
+        cells = []
+        for i, v in enumerate(r):
+            col = header[i] if i < len(header) else f"col{i}"
+            cells.append(f"{col}={v.strip()}" if col else v.strip())
+        lines.append("\t".join(cells))
+    return "\n".join(lines)
 
 
 def parse_pdf_streaming(filepath: str, on_batch, flush_pages: int = 20):
@@ -377,7 +567,7 @@ def parse_pdf_streaming(filepath: str, on_batch, flush_pages: int = 20):
                     from .ocr_engine import ocr_page_text
                     t = ocr_page_text(ocr, img)
                 else:
-                    t = page.get_text()
+                    t = _page_text_reflowed(page)
                 if t and t.strip():
                     buf.append(t.strip())
                     all_texts.append(t.strip())

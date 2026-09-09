@@ -9,22 +9,19 @@
              杜绝"编造不存在的引用"
 """
 import logging
-import httpx
-from config import (
-    MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL,
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_TIMEOUT,
-)
+from src.llm import call_llm, call_llm_stream
 
 logger = logging.getLogger("rag.chat")
 
-SYSTEM_PROMPT = """你是一个工业知识库助手。根据提供的文档内容回答用户问题。
+SYSTEM_PROMPT = """你是工业知识库助手「伏羲」。请自然、流畅、直接地回答用户问题，像一位熟悉资料的工程师在讲解一样。
 
 规则：
-1. 只基于下方「参考资料」中的内容回答，不要编造信息
-2. 每个关键结论后，用 [编号] 标注其依据的参考资料编号（如 [1]、[2][3]）
-3. 编号必须是参考资料里明确给出的序号，不得杜撰不存在的编号
-4. 如果参考资料中没有相关信息，明确告知用户，不要强行引用
-5. 回答简洁、准确、结构化，引用标注紧跟在对应句末"""
+1. 只基于下方「参考资料」中的内容回答，不要编造信息。
+2. 直接给出结论，不要用「根据参考资料」「可参考…章节」这类套话开头。
+3. 用自然段落行文，不要写成报告式条目罗列；除非问题本身需要分点（如步骤、参数清单），否则优先用通顺的句子。
+4. 引用标注用 [编号]，自然跟在对应句末（如「…推荐采用全屏蔽[1][3]」），编号必须是参考资料里已有的序号，不得杜撰。
+5. 如果参考资料中没有相关信息，坦诚告知，不要强行引用或自圆其说。
+6. 简洁、准确，只回答用户真正问的内容，不赘述无关背景。"""
 
 # 闲聊模式用的系统提示（自由对话，无强制引用约束）
 SYSTEM_PROMPT_CHAT = """你是一个友好、专业的工业知识库助手「伏羲」。
@@ -36,28 +33,45 @@ SYSTEM_PROMPT_CHAT = """你是一个友好、专业的工业知识库助手「�
 3. 不编造事实；若不确定，坦诚说明
 4. 简洁有条理"""
 
+# 聊天模式的单会话历史截断条数（统一口径，供 generate_chat 与 API 层共用，
+#   避免历史「6 条 vs 20 条」两套截止口径不一致导致的多轮连续性差异）。
+CHAT_HISTORY_LIMIT = 20
 
-def _build_reference_context(chunks: list[dict]) -> tuple[str, list[dict]]:
+
+def _build_reference_context(chunks: list[dict], max_chunk_chars: int = 800,
+                             max_total_chars: int = 6000) -> tuple[str, list[dict]]:
     """把检索结果组装成「带编号」的参考资料（供 LLM 引用标注）
 
     返回 (context_text, refs)，refs 为编号→chunk 的映射，含精确位置锚点。
+
+    上下文长度控制：单个 chunk 截断到 max_chunk_chars，总长度不超过 max_total_chars，
+    避免大文档超长 chunk 白耗 token，把预算留给真正相关的片段。
     """
     parts = []
     seen = set()
     refs = []
     idx = 0
+    total = 0
     for c in chunks:
-        content = c.get("content", "")
-        if not content or content in seen:
+        if total >= max_total_chars:
+            break
+        content = c.get("content", "") or ""
+        content = content.strip()
+        dedup_key = (c.get("id"), content)
+        if not content or dedup_key in seen:
             continue
-        seen.add(content)
+        seen.add(dedup_key)
+        # 单 chunk 截断
+        if len(content) > max_chunk_chars:
+            content = content[:max_chunk_chars] + "……"
         idx += 1
         fname = c.get("file_name", "未知文档")
-        # 位置锚点：chunk_index（文档内第几段），有则标注
         loc = ""
         if c.get("chunk_index") is not None:
             loc = f"（第 {c['chunk_index']} 段）"
-        parts.append(f"[{idx}]{loc}【{fname}】\n{content}")
+        block = f"[{idx}]{loc}【{fname}】\n{content}"
+        parts.append(block)
+        total += len(block)
         refs.append({
             "ref": idx,
             "file_id": c.get("file_id"),
@@ -69,15 +83,23 @@ def _build_reference_context(chunks: list[dict]) -> tuple[str, list[dict]]:
     return "\n\n---\n\n".join(parts), refs
 
 
+async def _call_llm_with_fallback(messages: list[dict], max_tokens: int = 1024) -> str:
+    """统一 LLM 降级调用，委托 src.llm。"""
+    try:
+        return await call_llm(messages, max_tokens=max_tokens)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.error(f"LLM 调用异常: {e}")
+        raise RuntimeError("LLM 调用失败") from e
+
+
 async def generate(query: str, context: list[dict]) -> tuple[str, list[dict]]:
     """
     组装 prompt → 调用 LLM → 返回 (answer, refs)
 
     refs：引用标注映射（编号 → chunk 精确位置），供前端渲染脚注。
-    向后兼容：调用方若只取 answer（如旧代码 `answer = await generate(...)`），
-    会拿到 tuple，需同步更新调用方（api.py 已更新）。
     """
-    # 组装带编号上下文 + 引用映射
     context_text, refs = _build_reference_context(context)
 
     messages = [
@@ -85,30 +107,7 @@ async def generate(query: str, context: list[dict]) -> tuple[str, list[dict]]:
         {"role": "user", "content": f"参考资料：\n\n{context_text}\n\n问题：{query}"}
     ]
 
-    # 前置检查：两个 LLM 均未配置 key 时快速失败，给出明确提示（避免空 key 裸 401 后再降级）
-    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
-        logger.error("LLM 未配置：MIMO_API_KEY 与 DEEPSEEK_API_KEY 均为空")
-        raise RuntimeError("LLM 服务未配置（缺失 API Key），请联系管理员在 .env 中配置")
-
-    # 优先 MiMo，失败切 DeepSeek；两者均失败时抛统一错误（交给全局异常处理器）
-    try:
-        answer = await _call_mimo(messages)
-    except Exception as e:
-        logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
-        if not DEEPSEEK_API_KEY:
-            logger.error("MiMo 失败且 DeepSeek 未配置，无法降级")
-            raise RuntimeError("LLM 调用失败：MiMo 不可用且未配置 DeepSeek 作为备用") from e
-        try:
-            answer = await _call_deepseek(messages)
-        except Exception as e2:
-            logger.error(f"DeepSeek 也失败: {e2}")
-            raise RuntimeError("LLM 调用失败（MiMo + DeepSeek 均不可用）") from e2
-
-    if not answer or not answer.strip():
-        # 推理型模型可能返回空 content（reasoning 抢占 max_tokens），给个可读的降级提示
-        logger.warning("LLM 返回空 content，使用降级提示")
-        answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
-
+    answer = await _call_llm_with_fallback(messages, max_tokens=1024)
     return answer, refs
 
 
@@ -118,30 +117,10 @@ async def generate_chat(query: str, history: list[dict] = None) -> str:
     返回纯 answer 字符串（无引用）。
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
-    # 可选多轮历史（最多带最近几轮，控制 token）
     if history:
-        messages.extend(history[-6:])  # 最多带最近 3 轮（6 条）
+        messages.extend(history[-CHAT_HISTORY_LIMIT:])
     messages.append({"role": "user", "content": query})
-
-    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
-        logger.error("LLM 未配置")
-        raise RuntimeError("LLM 服务未配置（缺失 API Key）")
-
-    try:
-        answer = await _call_mimo(messages)
-    except Exception as e:
-        logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
-        if not DEEPSEEK_API_KEY:
-            raise RuntimeError("LLM 调用失败：MiMo 不可用且未配置 DeepSeek") from e
-        try:
-            answer = await _call_deepseek(messages)
-        except Exception as e2:
-            logger.error(f"DeepSeek 也失败: {e2}")
-            raise RuntimeError("LLM 调用失败（MiMo + DeepSeek 均不可用）") from e2
-
-    if not answer or not answer.strip():
-        answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
-    return answer
+    return await _call_llm_with_fallback(messages, max_tokens=1024)
 
 
 # 联网模式系统提示：要求基于搜索结果回答并标注来源
@@ -167,25 +146,8 @@ async def generate_web(query: str, search_results: list[dict]) -> tuple[str, lis
         {"role": "user", "content": f"搜索结果：\n\n{context_text}\n\n问题：{query}"}
     ]
 
-    if not MIMO_API_KEY and not DEEPSEEK_API_KEY:
-        raise RuntimeError("LLM 服务未配置")
+    answer = await _call_llm_with_fallback(messages, max_tokens=1024)
 
-    try:
-        answer = await _call_mimo(messages)
-    except Exception as e:
-        logger.warning(f"MiMo 调用失败，降级 DeepSeek: {e}")
-        if not DEEPSEEK_API_KEY:
-            raise RuntimeError("LLM 调用失败") from e
-        try:
-            answer = await _call_deepseek(messages)
-        except Exception as e2:
-            logger.error(f"DeepSeek 也失败: {e2}")
-            raise RuntimeError("LLM 调用失败") from e2
-
-    if not answer or not answer.strip():
-        answer = "抱歉，模型暂未返回有效回答，请稍后重试。"
-
-    # 组装来源（带 ref 编号 + url）
     sources = [
         {
             "ref": i + 1,
@@ -202,52 +164,82 @@ def build_citation_sources(refs: list[dict], answer: str) -> list[dict]:
     """从 refs + answer 提取实际被引用的来源（供 api 返回精确锚点）
 
     解析 answer 中被引用的 [编号]，只返回真正被引用的来源。
-    若 answer 无任何引用标注，返回全部 refs（降级，保证有事可看）。
+    若 answer 无任何引用标注，返回空列表——不退回全部 refs。
+
+    理由（对齐「引用准确性」目标）：无引用标注意味着 LLM 未断言与文档的对应关系，
+    此时若返回全部 refs，会把「没被引用」的来源也塞给前端，制造「有据可查」的假象，
+    误导用户以为每个 refs 都支撑了这个回答。宁可空、不可虚。
     """
     import re
     cited = set(int(n) for n in re.findall(r'\[(\d+)\]', answer or ""))
     if not cited:
-        # 无引用标注：返回全部 refs 作为兜底来源
-        return refs
+        return []
     mapping = {r["ref"]: r for r in refs}
     return [mapping[n] for n in sorted(cited) if n in mapping]
 
 
-async def _call_mimo(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            f"{MIMO_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {MIMO_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MIMO_MODEL,
-                "messages": messages,
-                "max_tokens": 2048,
-                "temperature": 0.3,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+def check_citation_fidelity(refs: list[dict], answer: str) -> dict:
+    """引用忠实度校验（Citation Fidelity）—— RAG 可信度核心。
+
+    回验 LLM 答案里的引用标注：
+      1. 越界引用（phantom）：answer 出现 [编号] 但编号不在 refs 映射中（LLM 杜撰编号）
+      2. 模糊引用：含「依据/根据/参阅」等但未用 [n] 规范标注（提示可能幻觉）
+
+    返回 {healthy, phantoms, warnings}，供 orchestrator 记录告警（不阻断，仅可观测）。
+    """
+    import re
+    valid = {r["ref"] for r in refs}
+    cited = {int(n) for n in re.findall(r'\[(\d+)\]', answer or "")}
+    phantoms = sorted(cited - valid)
+    warnings = []
+    fuzzy = re.findall(r'(?:依据|根据|参阅|参考|见)\s*(?:资料|文档|数据|上|编号)\s*[\d一二三四五]?', answer or "")
+    if fuzzy:
+        warnings.append(f"存在 {len(fuzzy)} 处未规范标注的模糊引用（疑似）")
+    return {"healthy": not phantoms, "phantoms": phantoms, "warnings": warnings}
 
 
-async def _call_deepseek(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
-        resp = await client.post(
-            f"{DEEPSEEK_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": messages,
-                "max_tokens": 2048,
-                "temperature": 0.3,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+def clean_phantom_citations(refs: list[dict], answer: str) -> str:
+    """清洗杜撰引用编号：把 answer 中超出 refs 范围（越界）的 [编号] 剔除，返回清洗后的 answer。
+
+    背景：LLM 可能输出超出 refs 数量的编号（refs 只 5 条，LLM 写 [6]），
+    前端点击该脚注会得到空/错来源，损害可信度。此处做词级处理：
+      - 越界编号（n > max_ref）：删除该 [n]（连同可能紧邻的逗号/顿号/空格）
+      - 合法编号保留不动（含 [n][m] 连续形态）
+    零 LLM、纯正则、不阻断；仅在答案真的含越界编号时才改动。
+    """
+    if not answer or not refs:
+        return answer
+    import re
+    max_ref = max(r["ref"] for r in refs)
+    # 逐个替换越界编号：[n]（n > max_ref），连同前导逗号/顿号/空格或后随的同类分隔
+    def _replace(m):
+        n = int(m.group(1))
+        return "" if n > max_ref else m.group(0)
+
+    cleaned = re.sub(r'\[(\d+)\]', _replace, answer)
+    # 清理替换后可能残留的孤立标点（如「，[6]」删成「，」或「 、 」）——仅清理紧跟的孤立分隔符
+    cleaned = re.sub(r'([，、\s])([，、])+', r'\1', cleaned)
+    cleaned = re.sub(r'，\s*$', '', cleaned)
+    return cleaned
+
+
+
+
+
+async def generate_stream(query: str, context: list[dict]):
+    """流式生成：yield 每个 token chunk，最后 yield __SOURCES__ + JSON。
+
+    __SOURCES__ 事件用单行紧凑 JSON（ensure_ascii=True + 无分隔空格 + 去真实换行），
+    从根上避免 refs 里的 content/file_name 含换行或特殊串（__SOURCES__/[DONE]）破坏
+    SSE 逐 token 的 `data: {token}` 单行帧（历史线上断行 bug 的根因）。
+    """
+    import json as _json
+    context_text, refs = _build_reference_context(context)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"参考资料：\n\n{context_text}\n\n问题：{query}"}
+    ]
+    async for token in call_llm_stream(messages, max_tokens=1024):
+        yield token
+    # 单行安全：ensure_ascii 把换行/特殊字符都转成 \n 转义，separators 去空白，保证无反斜杠换行
+    yield "__SOURCES__" + _json.dumps(refs, ensure_ascii=True, separators=(",", ":"))

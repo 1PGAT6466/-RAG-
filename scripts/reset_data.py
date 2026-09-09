@@ -21,9 +21,12 @@ def reset():
     conn = _get_conn()
 
     # 1. 清空业务表（按外键依赖顺序）
+    # 注意：chunks_fts 与 chunks_fts_tri 两个 FTS5 虚拟表都必须清空，
+    # 否则残留的 trigram rowid 会与新 chunk 的 AUTOINCREMENT 冲突
+    # （sqlite3.IntegrityError: constraint failed，见 MEMORY）。
     tables = [
         "entity_relations", "entity_chunks", "entity_files",
-        "links", "chunks_fts", "chunks", "files", "entities",
+        "links", "chunks_fts", "chunks_fts_tri", "chunks", "files", "entities",
     ]
     for t in tables:
         try:

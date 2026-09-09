@@ -35,6 +35,7 @@ CONNECTOR_DICT = {
     "HDMI": "HDMI 连接器",
     "M8": "M8 圆形连接器",
     "M12": "M12 圆形连接器",
+    "AK2": "AK2 系列连接器",
 }
 
 # 连接器型号正则：明确的品牌/系列前缀（如 MLG12 系列），避免泛化 `[A-Z]\d` 误伤
@@ -74,8 +75,30 @@ _GF_PATTERN = re.compile(r'\bGF\s?\d+\b', re.IGNORECASE)
 # 工艺关键词
 PROCESS_KEYWORDS = ["装配", "焊接", "冲压", "注塑", "电镀", "镀金", "镀锡", "压接", "铆接", "热处理"]
 
+# 实体别名字典（同义归并）：抽到实体时自动补别名，提升检索同义匹配 + 图谱归并
+# key: 实体名；value: 别名列表（全称/缩写/俗名/常见变体）
+ENTITY_ALIAS_MAP = {
+    # 材料：全称 ↔ 俗称 ↔ 常见牌号
+    "铜合金": ["紫铜", "纯铜", "T2"],
+    "黄铜": ["H62", "H65"],
+    "不锈钢": ["SUS304", "SUS302", "SUS316", "不锈钢304", "1Cr18Ni9"],
+    "磷青铜": ["QSn", "锡青铜"],
+    "PEEK": ["聚醚醚酮"],
+    "PPS": ["聚苯硫醚"],
+    "LCP": ["液晶聚合物", "液晶高分子"],
+    "PA66": ["尼龙66", "尼龙 66"],
+    "PA6": ["尼龙6", "尼龙 6"],
+    "PBT": ["聚对苯二甲酸丁二醇酯"],
+    "ABS": ["丙烯腈-丁二烯-苯乙烯"],
+    # 工艺：同义词
+    "镀金": ["金镀层", "镀金层"],
+    "电镀": ["电镀工艺", "镀覆"],
+    "焊接": ["焊工艺", "锡焊"],
+    "热处理": ["热工艺"],
+    "注塑": ["注射成型", "注塑成型"],
+}
+
 # 材料-工艺相容性知识表（领域客观事实，用于建语义边 compatible_process）
-# 值：该材料可采用/适用的工艺
 MATERIAL_PROCESS_MAP = {
     "黄铜": ["热处理", "焊接", "电镀", "冲压", "压接"],
     "磷青铜": ["热处理", "电镀", "冲压", "压接"],
@@ -132,6 +155,10 @@ PARAM_PATTERNS = [
     ("插拔寿命", r'(?:插拔寿命|插拔次数|寿命)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(次|万次)?'),
     ("接触电阻", r'接触电阻\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(mΩ|Ω)?'),
     ("镀层厚度", r'(?:镀层厚度|镀金厚度|镀层)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(μm|um|微米|u\"|μ\")?'),
+    ("绝缘电阻", r'绝缘电阻\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(MΩ|GΩ|Ω)?'),
+    ("介电常数", r'介电常数\s*[:：]?\s*(\d+(?:\.\d+)?)'),
+    ("耐压", r'(?:耐压|耐电压|介电强度)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(kV|V|kV/mm)?'),
+    ("爬电距离", r'爬电距离\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(mm)?'),
 ]
 
 # 标准号正则（跨换行匹配：PDF 中标准号常被换行拆开，如 "GB/T\n157-2001"）
@@ -170,6 +197,16 @@ def _normalize_standard_name(raw: str) -> str | None:
     return f"{prefix} {num}"
 
 
+def _match_word(pattern: str, text: str) -> bool:
+    """词匹配：纯 ASCII 词用 \b 边界（避免子串误命中），含中文词用子串直接匹配
+
+    （\b 对中文边界无效，这是历史 bug 根因：中文材料词如「铜合金/不锈钢」用 \b 永远匹配不到）
+    """
+    if pattern.isascii():
+        return re.search(r'\b' + re.escape(pattern) + r'\b', text, re.IGNORECASE) is not None
+    return pattern in text
+
+
 def extract_rule(text: str) -> list[dict]:
     """规则抽取：返回结构化实体列表（无需 LLM）"""
     if not text:
@@ -179,7 +216,7 @@ def extract_rule(text: str) -> list[dict]:
     # 先抽材料（优先，避免材料牌号被误识别为型号）
     seen_material = set()
     for mat, desc in MATERIAL_DICT.items():
-        if re.search(r'\b' + re.escape(mat) + r'\b', text, re.IGNORECASE):
+        if _match_word(mat, text):
             key = mat.lower()
             if key in seen_material:
                 continue
@@ -191,6 +228,29 @@ def extract_rule(text: str) -> list[dict]:
                 "description": desc,
                 "attributes": {},
             })
+
+    # 不锈钢牌号（SUS304/1Cr18Ni9 等）→ 归并到「不锈钢」material，牌号记入 aliases/variants
+    alloy_variants = {m.group(0).replace(" ", "") for m in _STAINLESS_ALLOY.finditer(text)}
+    if alloy_variants:
+        # 找已识别的不锈钢实体（材料循环里可能已产出），否则新建
+        ss_entity = next((e for e in entities if e.get("name") == "不锈钢" and e.get("type") == "material"), None)
+        if ss_entity is None:
+            ss_entity = {
+                "name": "不锈钢",
+                "type": "material",
+                "aliases": [],
+                "description": "不锈钢",
+                "attributes": {},
+            }
+            entities.append(ss_entity)
+            seen_material.add("不锈钢")
+        # 合并牌号到 aliases + variants
+        merged_aliases = set(ss_entity.get("aliases", []) or [])
+        merged_aliases.update(alloy_variants)
+        ss_entity["aliases"] = sorted(merged_aliases)
+        variants = set((ss_entity.get("attributes") or {}).get("variants", []) or [])
+        variants.update(alloy_variants)
+        ss_entity["attributes"] = {**ss_entity.get("attributes", {}), "variants": sorted(variants)}
 
     # 连接器型号（词典优先，带描述；正则兜底补系列号）
     seen = set()
@@ -317,6 +377,9 @@ def _dedup(entities: list[dict]) -> list[dict]:
 # 系列前缀模式：MLG12-45 → 系列 MLG12 + 规格 45（连接器系列型号归并）
 _SERIES_PATTERN = re.compile(r'\b([A-Z]{1,6}\d{1,3})-(\d{2,4})\b')
 
+# 不锈钢牌号：SUS304/SUS302/1Cr18Ni9 等，归并到「不锈钢」实体（作为 variants/别名）
+_STAINLESS_ALLOY = re.compile(r'\b(?:SUS\s?\d{2,3}|1Cr18Ni9|304|316L?|2Cr13|3Cr13)\b')
+
 # 泛化词（不具区分度的通用词，LLM 可能误抽为实体，需过滤）
 _GENERIC_STOPWORDS = {
     "连接器", "连接器设计", "设计流程", "设计", "结构", "产品", "零件",
@@ -348,6 +411,10 @@ def normalize_entities(entities: list[dict]) -> list[dict]:
         # 1) 泛化词过滤
         if name.lower() in {g.lower() for g in _GENERIC_STOPWORDS}:
             continue
+        # 1.5) 别名自动补全（同义归并）：按别名字典，补全 aliases
+        aliases_extra = ENTITY_ALIAS_MAP.get(name, [])
+        if aliases_extra:
+            e["aliases"] = sorted(set((e.get("aliases") or []) + aliases_extra))
         # 2) 系列归并（仅 connector 类型）
         if e.get("type") == "connector":
             m = _SERIES_PATTERN.fullmatch(name)
@@ -401,35 +468,13 @@ _LLM_SYSTEM_PROMPT = """你是工业知识库的实体抽取引擎。从给定�
 
 
 def _llm_call_sync(text: str) -> str:
-    """同步调用 LLM（MiMo 优先，失败降级 DeepSeek），返回 content 字符串"""
-    import httpx
-    from config import MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, \
-        DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_FLASH_MODEL, DEEPSEEK_TIMEOUT
-
+    """同步调用 LLM（MiMo 优先），委托 src.llm。"""
+    from src.llm import call_llm_sync
     messages = [
         {"role": "system", "content": _LLM_SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
-
-    try:
-        with httpx.Client(timeout=60) as client:
-            resp = client.post(
-                f"{MIMO_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
-                json={"model": MIMO_MODEL, "messages": messages, "max_tokens": 4096, "temperature": 0.1},
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.warning(f"MiMo 实体抽取失败，降级 DeepSeek: {e}")
-        with httpx.Client(timeout=DEEPSEEK_TIMEOUT) as client:
-            resp = client.post(
-                f"{DEEPSEEK_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-                json={"model": DEEPSEEK_FLASH_MODEL, "messages": messages, "max_tokens": 4096, "temperature": 0.1},
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+    return call_llm_sync(messages, max_tokens=4096, prefer_mimo=True)
 
 
 def extract_llm_sync(text: str) -> list[dict]:
@@ -440,10 +485,11 @@ def extract_llm_sync(text: str) -> list[dict]:
 
 
 def _parse_json_array(content: str) -> list[dict]:
-    """从 LLM 输出中稳健地提取 JSON 数组"""
+    """从 LLM 输出中稳健地提取 JSON 数组，委托 src.llm.extract_json。"""
+    from src.llm import extract_json
     if not content:
         return []
-    # 尝试直接解析
+    # 先尝试直接解析整个内容（可能含 entities 包装）
     try:
         data = json.loads(content)
         if isinstance(data, list):
@@ -452,15 +498,9 @@ def _parse_json_array(content: str) -> list[dict]:
             return data["entities"]
     except json.JSONDecodeError:
         pass
-    # 提取 [...] 块
-    start = content.find("[")
-    end = content.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        try:
-            data = json.loads(content[start:end + 1])
-            return [d for d in data if isinstance(d, dict)]
-        except json.JSONDecodeError:
-            pass
+    data = extract_json(content, expect="array")
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
     return []
 
 
@@ -511,10 +551,8 @@ def llm_classify_standards(names: list[str]) -> dict[str, str]:
 
 
 def _call_llm_classify_batch(names: list[str]) -> dict[str, str]:
-    """单批 LLM 标准分类（≤20 个）"""
-    import httpx
-    from config import MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, \
-        DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_TIMEOUT
+    """单批 LLM 标准分类（≤20 个），委托 src.llm。"""
+    from src.llm import call_llm_sync, extract_json
 
     domains = "、".join(STANDARD_DOMAINS)
     user = (
@@ -528,42 +566,8 @@ def _call_llm_classify_batch(names: list[str]) -> dict[str, str]:
         {"role": "system", "content": "你是工业标准分类专家。请严格按照 JSON 格式输出，不要输出任何多余文字。"},
         {"role": "user", "content": user},
     ]
-
-    def _parse(content):
-        if not content:
-            return {}
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1:
-            return {}
-        try:
-            data = json.loads(content[start:end + 1])
-            if isinstance(data, dict):
-                return {k: v for k, v in data.items() if v in STANDARD_DOMAINS}
-        except json.JSONDecodeError:
-            pass
-        return {}
-
-    try:
-        with httpx.Client(timeout=120) as client:
-            resp = client.post(
-                f"{MIMO_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {MIMO_API_KEY}", "Content-Type": "application/json"},
-                json={"model": MIMO_MODEL, "messages": messages, "max_tokens": 4096, "temperature": 0.1},
-            )
-            resp.raise_for_status()
-            return _parse(resp.json()["choices"][0]["message"]["content"])
-    except Exception as e:
-        logger.warning(f"MiMo 标准分类失败，降级 DeepSeek: {e}")
-        try:
-            with httpx.Client(timeout=DEEPSEEK_TIMEOUT) as client:
-                resp = client.post(
-                    f"{DEEPSEEK_BASE_URL}/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-                    json={"model": DEEPSEEK_FLASH_MODEL, "messages": messages, "max_tokens": 4096, "temperature": 0.1},
-                )
-                resp.raise_for_status()
-                return _parse(resp.json()["choices"][0]["message"]["content"])
-        except Exception as e2:
-            logger.warning(f"DeepSeek 标准分类也失败: {e2}")
-            return {}
+    content = call_llm_sync(messages, max_tokens=4096, prefer_mimo=True)
+    data = extract_json(content, expect="object")
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if v in STANDARD_DOMAINS}
+    return {}

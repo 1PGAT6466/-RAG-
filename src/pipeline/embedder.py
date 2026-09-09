@@ -19,6 +19,7 @@ _LOCAL_MODEL_DIM = None
 # 本地模型不可用缓存：加载失败一次后不再重复尝试（避免流式入库每批都白加载）
 _LOCAL_UNAVAILABLE = False
 _LOCAL_CHECKED = False
+_embedder_lock = __import__('threading').Lock()
 
 # 超过该 chunk 数自动切远程（本地 CPU 向量化大文档太慢）
 from config import EMBED_REMOTE_THRESHOLD as REMOTE_THRESHOLD
@@ -75,32 +76,53 @@ def _get_local_path() -> str:
 
 
 def _has_weights(model_dir) -> bool:
-    """检查模型目录里是否有真正的权重文件（非仅 config）"""
+    """检查模型目录里是否有真正的权重文件（非仅 config，且非 0 字节占位）。
+
+    历史坑：HF 下载失败会留下 0 字节的 model.safetensors 占位文件，
+    若只查文件名不查大小，会误判「有权重」→ 每次 encode 都重复加载失败。
+    故这里同时校验文件 > 1KB，过滤空占位。
+    """
     from pathlib import Path
     d = Path(model_dir)
     if not d.is_dir():
         return False
     for f in d.iterdir():
-        if f.name in ("model.safetensors", "pytorch_model.bin", "model.bin", "pytorch_model.bin.index.json"):
-            return True
-        if f.name.startswith("model-") and f.name.endswith(".safetensors"):  # 分片 safetensors
+        if f.name in ("pytorch_model.bin", "model.safetensors", "model.bin", "pytorch_model.bin.index.json"):
+            if f.is_file() and f.stat().st_size > 1024:
+                return True
+        if f.name.startswith("model-") and f.name.endswith(".safetensors") and f.stat().st_size > 1024:  # 分片 safetensors
             return True
     return False
 
 
 def _encode_local(texts: list[str], progress_cb=None) -> list[bytes]:
-    """本地 sentence-transformers"""
+    """本地 sentence-transformers（可选 ONNX INT8 量化加速）"""
     global _embedder, _LOCAL_MODEL_DIM, _LOCAL_UNAVAILABLE
     if _LOCAL_UNAVAILABLE:
         raise RuntimeError("本地模型不可用（已缓存）")
     if _embedder is None:
-        from config import EMBEDDING_DEVICE
-        from sentence_transformers import SentenceTransformer
-        path = _get_local_path()
-        logger.info(f"加载本地模型: {path}")
-        _embedder = SentenceTransformer(path, device=EMBEDDING_DEVICE)
-        _LOCAL_MODEL_DIM = _embedder.get_embedding_dimension()
-        logger.info(f"本地模型就绪，维度={_LOCAL_MODEL_DIM}")
+        with _embedder_lock:
+            if _embedder is None:  # double-checked locking
+                from config import EMBEDDING_DEVICE, EMBEDDING_ONNX
+                path = _get_local_path()
+                logger.info(f"加载本地模型: {path}")
+                if EMBEDDING_ONNX == "1":
+                    try:
+                        from optimum.onnxruntime import ORTModelForFeatureExtraction
+                        from sentence_transformers import SentenceTransformer
+                        # ONNX 量化推理：2-4x CPU 加速，INT8 量化
+                        _embedder = SentenceTransformer(path, device=EMBEDDING_DEVICE,
+                            model_kwargs={"export": True, "provider": "CPUExecutionProvider"})
+                        logger.info("使用 ONNX 量化推理")
+                    except Exception as e:
+                        logger.warning(f"ONNX 加载失败，回退标准模式: {e}")
+                        from sentence_transformers import SentenceTransformer
+                        _embedder = SentenceTransformer(path, device=EMBEDDING_DEVICE)
+                else:
+                    from sentence_transformers import SentenceTransformer
+                    _embedder = SentenceTransformer(path, device=EMBEDDING_DEVICE)
+                _LOCAL_MODEL_DIM = _embedder.get_embedding_dimension()
+                logger.info(f"本地模型就绪，维度={_LOCAL_MODEL_DIM}")
 
     # 大 batch 在 CPU 上会长时间阻塞无反馈，分批编码并回调进度
     batch_size = 64
@@ -148,10 +170,12 @@ def _encode_remote(texts: list[str], progress_cb=None) -> list[bytes]:
     return [_pack(v) for v in all_embeddings]
 
 
-def encode(texts: list[str], progress_cb=None) -> list[bytes]:
+def encode(texts: list[str], progress_cb=None, force_remote: bool = False) -> list[bytes]:
     """文本列表 → embedding bytes。
 
     混合策略：大 batch（> REMOTE_THRESHOLD）走远程 SiliconFlow，否则本地。
+    force_remote=True 时忽略阈值，直接走远程（流式大 PDF 逐批 embed 时用，
+    避免每批几十个 chunk 永远触发不了阈值而退回本地 CPU 慢跑）。
     progress_cb(done, total)：可选进度回调，逐批上报（本地/远程均支持），
     用于入库时向任务状态实时上报进度（大 PDF 向量化不再干等无反馈）。
     """
@@ -159,6 +183,18 @@ def encode(texts: list[str], progress_cb=None) -> list[bytes]:
     n = len(texts)
     if n == 0:
         return []
+
+    # 强制远程：流式大 PDF 逐批 embed 时，直接走远程（本地 CPU 对大文档太慢）
+    if force_remote:
+        try:
+            return _encode_remote(texts, progress_cb)
+        except Exception as e:
+            logger.warning(f"强制远程向量化失败，降级本地: {e}")
+            try:
+                return _encode_local(texts, progress_cb)
+            except Exception:
+                pass
+            raise
 
     # 方案 C：超过阈值切远程（大文档快）
     if n > REMOTE_THRESHOLD:
@@ -203,4 +239,41 @@ def _unpack(data: bytes) -> np.ndarray:
 def cosine_similarity(vec_a: bytes, vec_b: bytes) -> float:
     a = _unpack(vec_a)
     b = _unpack(vec_b)
-    return float(np.dot(a, b))
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+# === SQ8 标量量化（向量存储 4 倍压缩）===
+# float32 (4 bytes/dim) → int8 (1 byte/dim) + 8 bytes scale/offset
+# 适用场景：向量存储空间紧张时，用 SQ8 压缩到 1/4，<2% 召回损失
+
+def quantize_sq8(vec: bytes) -> tuple[bytes, float, float]:
+    """SQ8 量化：float32 向量 → (int8 bytes, min_val, scale)"""
+    a = _unpack(vec)
+    vmin, vmax = float(a.min()), float(a.max())
+    if vmax == vmin:
+        return b'\x00' * len(a), vmin, 1.0
+    scale = (vmax - vmin) / 255.0
+    quantized = np.clip((a - vmin) / scale, 0, 255).astype(np.uint8)
+    return quantized.tobytes(), vmin, scale
+
+
+def dequantize_sq8(data: bytes, vmin: float, scale: float) -> np.ndarray:
+    """SQ8 反量化：(int8 bytes, min, scale) → float32 向量"""
+    q = np.frombuffer(data, dtype=np.uint8).astype(np.float32)
+    return q * scale + vmin
+
+
+def cosine_similarity_sq8(vec_a: bytes, vmin_a: float, scale_a: float,
+                          vec_b: bytes, vmin_b: float, scale_b: float) -> float:
+    """SQ8 量化向量的余弦相似度（反量化后计算）"""
+    a = dequantize_sq8(vec_a, vmin_a, scale_a)
+    b = dequantize_sq8(vec_b, vmin_b, scale_b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
