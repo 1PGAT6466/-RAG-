@@ -65,6 +65,9 @@
               <template #prefix><el-icon><Lock /></el-icon></template>
             </el-input>
           </el-form-item>
+          <div class="login-remember">
+            <el-checkbox v-model="rememberMe">记住账号和密码</el-checkbox>
+          </div>
           <el-form-item style="margin-bottom:8px">
             <el-button type="primary" size="large" :loading="loading" native-type="submit" style="width:100%">
               {{ isRegister ? '注册' : '登录' }}
@@ -92,14 +95,32 @@ const auth = useAuthStore()
 const isRegister = ref(false)
 const loading = ref(false)
 const error = ref('')
+const formRef = ref(null)
 
 const form = reactive({ username: '', password: '' })
+const rememberMe = ref(false)
+
+// 页面加载时从 localStorage 读取保存的账号密码
+const savedCreds = localStorage.getItem('saved_credentials')
+if (savedCreds) {
+  try {
+    const { u, p } = JSON.parse(savedCreds)
+    form.username = u || ''
+    form.password = p || ''
+    rememberMe.value = true
+  } catch {}
+}
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   password: [{ required: true, min: 6, message: '密码至少6位', trigger: 'blur' }]
 }
 
 async function handleSubmit() {
+  try {
+    await formRef.value.validate()
+  } catch {
+    return
+  }
   loading.value = true
   error.value = ''
   try {
@@ -108,6 +129,12 @@ async function handleSubmit() {
       await auth.login(form.username, form.password)
     } else {
       await auth.login(form.username, form.password)
+    }
+    // 保存或清除凭据
+    if (rememberMe.value) {
+      localStorage.setItem('saved_credentials', JSON.stringify({ u: form.username, p: form.password }))
+    } else {
+      localStorage.removeItem('saved_credentials')
     }
     router.push('/')
   } catch (e) {
@@ -412,7 +439,7 @@ async function handleSubmit() {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: 1px;
-  background: linear-gradient(135deg, #13a89e 0%, #0e6e6a 100%);
+  background: linear-gradient(135deg, var(--accent-mid, #13a89e) 0%, var(--accent) 100%);
   border: none;
   box-shadow: 0 8px 22px rgba(14, 110, 106, 0.3);
   transition: transform 0.2s ease, box-shadow 0.2s ease;
@@ -425,6 +452,13 @@ async function handleSubmit() {
   transform: translateY(0);
 }
 
+.login-remember {
+  margin-bottom: 12px;
+}
+.login-remember .el-checkbox {
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
 .login-switch {
   text-align: center;
   font-size: 13px;

@@ -148,6 +148,40 @@ CREATE TABLE IF NOT EXISTS images (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_images_file ON images(file_id);
+CREATE TABLE IF NOT EXISTS wiki_pages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '未分类',
+    content_md TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    source_file_ids TEXT NOT NULL DEFAULT '[]',
+    entity_ids TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'draft',
+    compiled_by TEXT NOT NULL DEFAULT 'llm',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_cat ON wiki_pages(category);
+CREATE INDEX IF NOT EXISTS idx_wiki_status ON wiki_pages(status);
+CREATE TABLE IF NOT EXISTS wiki_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    to_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL DEFAULT 'wiki',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    UNIQUE(from_page_id, to_page_id, link_type)
+);
+CREATE TABLE IF NOT EXISTS wiki_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content_md TEXT NOT NULL,
+    changed_by TEXT NOT NULL DEFAULT 'llm',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
 CREATE TABLE IF NOT EXISTS dms_imports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER,
@@ -173,8 +207,65 @@ CREATE TABLE IF NOT EXISTS tasks (
     category TEXT NOT NULL DEFAULT '',
     file_id INTEGER,
     error TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    next_retry_at REAL NOT NULL DEFAULT 0,
+    dead_letter INTEGER NOT NULL DEFAULT 0,
+    checkpoint_stage TEXT NOT NULL DEFAULT '',
+    checkpoint_data TEXT NOT NULL DEFAULT '{}'
 );
+
+-- C1: 文件权限表
+CREATE TABLE IF NOT EXISTS file_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    user_id INTEGER,
+    role TEXT,
+    permission TEXT NOT NULL DEFAULT 'read',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_fp_file ON file_permissions(file_id);
+CREATE INDEX IF NOT EXISTS idx_fp_user ON file_permissions(user_id);
+
+-- W4: 语义缓存表
+CREATE TABLE IF NOT EXISTS semantic_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_hash TEXT NOT NULL,
+    query TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    sources TEXT NOT NULL DEFAULT '[]',
+    embedding BLOB,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    last_hit_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sc_hash ON semantic_cache(query_hash);
+
+-- S8: Rerank 缓存表
+CREATE TABLE IF NOT EXISTS rerank_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    query TEXT NOT NULL,
+    results TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_rc_fp ON rerank_cache(fingerprint);
+
+-- 审计日志表
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    action TEXT NOT NULL DEFAULT '',
+    target_type TEXT,
+    target_id INTEGER,
+    detail TEXT,
+    ip TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 """
 
 
@@ -241,6 +332,19 @@ def init_db():
     _migrate_add_column(conn, "files", "folder", "TEXT NOT NULL DEFAULT '/'")
     _migrate_add_column(conn, "files", "doc_kind", "TEXT NOT NULL DEFAULT '未分类'")
     _migrate_add_column(conn, "files", "authority", "INTEGER NOT NULL DEFAULT 0")
+    # P20: 任务队列持久化 + 重试
+    _migrate_add_column(conn, "tasks", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(conn, "tasks", "max_retries", "INTEGER NOT NULL DEFAULT 3")
+    _migrate_add_column(conn, "tasks", "next_retry_at", "REAL NOT NULL DEFAULT 0")
+    _migrate_add_column(conn, "tasks", "dead_letter", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(conn, "tasks", "checkpoint_stage", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(conn, "tasks", "checkpoint_data", "TEXT NOT NULL DEFAULT '{}'")
+    # P3: 清洗质量分
+    _migrate_add_column(conn, "files", "quality_score", "INTEGER NOT NULL DEFAULT -1")  # -1=未评分, 0-100=质量分
+    # P22: 上传去重（content hash）
+    _migrate_add_column(conn, "files", "content_hash", "TEXT DEFAULT NULL")
+    # P23: 回收站（软删除）
+    _migrate_add_column(conn, "files", "deleted_at", "TEXT DEFAULT NULL")
     conn.commit()
 
 

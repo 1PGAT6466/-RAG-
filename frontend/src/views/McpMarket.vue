@@ -1,5 +1,6 @@
 <template>
   <div class="mcp-page">
+    <PageBack to="/plugins" label="返回插件" />
     <div class="page-header">
       <div>
         <h2 class="page-title"><el-icon><Shop /></el-icon>MCP 市场</h2>
@@ -183,6 +184,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import mcpApi from '../api/mcp'
+import PageBack from '../components/PageBack.vue'
 
 const auth = useAuthStore()
 const tab = ref('market')
@@ -298,7 +300,7 @@ async function loadInstalled() {
     const { data } = await mcpApi.installed()
     installed.value = data.data || []
   } catch (e) {
-    console.error('加载已安装 MCP 失败', e)
+    ElMessage.error('加载已安装 MCP 失败：' + (e.response?.data?.detail || e.message))
   } finally {
     installedLoading.value = false
   }
@@ -344,7 +346,6 @@ async function doInstall() {
     await loadInstalled()
     tab.value = 'installed'
   } catch (e) {
-    console.error('安装失败', e)
     ElMessage.error('安装失败：' + (e.response?.data?.detail || e.message))
   } finally {
     installing.value = false
@@ -360,7 +361,7 @@ async function doUninstall(s) {
     if (expandedQn.value === s.qualifiedName) expandedQn.value = ''
     await loadInstalled()
   } catch (e) {
-    console.error('卸载失败', e)
+    ElMessage.error('卸载失败：' + (e.response?.data?.detail || e.message))
   }
 }
 
@@ -442,6 +443,8 @@ onMounted(() => {
 <style scoped>
 .mcp-page {
   padding: 24px 28px;
+  height: 100%;
+  overflow-y: auto;
 }
 .page-header {
   display: flex;

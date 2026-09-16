@@ -24,6 +24,14 @@ _CHAT_PATTERNS = [
     r'(我很|我有点|我最近)(开心|难过|无聊|累|烦|生气|焦虑|emo)',
 ]
 
+# 元查询触发词（关于知识库本身的提问，无需检索，直接查数据库）
+_META_PATTERNS = [
+    r'(知识库|文档库|系统|库里).{0,10}(有|多少|总共|一共|几|多少个|有多少).{0,6}(文件|文档|资料|数据|条)',
+    r'(有|多少|总共|一共|几).{0,6}(文件|文档|资料|条).{0,6}(在|上传|入库|知识库)',
+    r'(知识库|文档库).{0,6}(包含|收录|存了|有)',
+    r'(列出|展示|看看|显示).{0,6}(所有|全部|哪些).{0,4}(文件|文档)',
+]
+
 # 联网触发词（实时/外部信息需求）。识别后第一阶段若无搜索 key 则降级 chat。
 _WEB_PATTERNS = [
     r'(今天|现在|最近|目前|最新|明天|未来几天).{0,8}(天气|气温|温度|下雨|下雪|降水|台风|晴|阴)',
@@ -38,14 +46,18 @@ _WEB_PATTERNS = [
 
 _CAT_RE = [re.compile(p) for p in _CHAT_PATTERNS]
 _WEB_RE = [re.compile(p) for p in _WEB_PATTERNS]
+_META_RE = [re.compile(p) for p in _META_PATTERNS]
 
 
 def _rule_classify(query: str) -> str:
-    """规则快判：chat > web 优先级（chat 更明确），否则 knowledge"""
+    """规则快判：chat > meta > web 优先级（chat 更明确），否则 knowledge"""
     q = query.strip()
     for pat in _CAT_RE:
         if pat.search(q):
             return "chat"
+    for pat in _META_RE:
+        if pat.search(q):
+            return "meta"
     for pat in _WEB_RE:
         if pat.search(q):
             return "web"
@@ -96,7 +108,7 @@ async def classify_intent_async(query: str) -> str:
             _call_llm_with_fallback([
                 {"role": "system", "content": _INTENT_SYSTEM},
                 {"role": "user", "content": query},
-            ], max_tokens=1024),  # 1024：推理型模型 reasoning 波动大（实测 267~850），过小会截空触发降级/超时
+            ], max_tokens=256),  # 256：输出仅 1 个词，reasoning 放大后仍够用
             timeout=8.0,  # 快判独立短超时，避免拖慢对话
         )
         ans = (answer or "").strip().lower()
@@ -301,7 +313,7 @@ async def rewrite_query(query: str) -> str:
         rewritten = await _call_llm_with_fallback([
             {"role": "system", "content": "你是检索查询优化器。只输出改写后的查询词，不要其他内容。"},
             {"role": "user", "content": prompt},
-        ], max_tokens=2048)  # 2048：推理型模型 reasoning 波动大（213~850+），确保不截空不再触发重试
+        ], max_tokens=512)  # 512：输出仅 20-50 字，reasoning 放大后仍够用
         if rewritten and len(rewritten.strip()) > 2:
             result = rewritten.strip().replace("\n", " ")
             # 安全网：改写跑偏检测

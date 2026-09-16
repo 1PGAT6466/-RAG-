@@ -1,4 +1,6 @@
 """api/feedback.py — 对话反馈路由（赞/踩，阶段一：只落库）"""
+import json as _json
+import re as _re
 import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
@@ -41,7 +43,9 @@ def api_add_feedback(req: FeedbackReq, user=Depends(get_current_user)):
 def api_remove_feedback(kind: str, query: str = "", chunk_ids: str = "[]",
                               user=Depends(get_current_user)):
     """撤销反馈（点赞/点踩可取消）。chunk_ids 传 JSON 数组字符串。"""
-    import json as _json
+    # S8: kind 参数校验（只能是 up/down）
+    if not _re.match(r'^(up|down)$', kind):
+        raise HTTPException(status_code=400, detail="kind 参数只能是 up 或 down")
     try:
         cids = _json.loads(chunk_ids or "[]")
     except Exception:

@@ -95,6 +95,8 @@ def _fetch_all(progress_cb=None) -> list[dict]:
                 page += 1
                 if page > 50:  # 安全上限
                     break
+                # S12: 速率限制，避免全量拉取时过于频繁
+                time.sleep(0.5)
     except Exception as e:
         logger.warning(f"MCP 全量拉取失败: {e}")
         return []

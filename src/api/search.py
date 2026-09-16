@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
-from src.auth.deps import get_current_user
+from src.auth.deps import get_current_user, require_admin
 from src.retrieval.search import search
 
 logger = logging.getLogger("rag.api.search")
@@ -13,6 +13,9 @@ router = APIRouter()
 class SearchReq(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(10, ge=1, le=50)
+    category: str = Field(None, description="按分类过滤")
+    authority: int = Field(None, description="按权威度过滤 (0-3)")
+    folder: str = Field(None, description="按文件夹过滤")
 
 class FindFileReq(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -20,12 +23,17 @@ class FindFileReq(BaseModel):
 
 @router.post("/api/search")
 async def api_search(req: SearchReq, user=Depends(get_current_user)):
-    results = await search(req.query, top_k=req.top_k)
+    """混合检索（BM25+向量+图谱+文件名）"""
+    results = await search(
+        req.query, top_k=req.top_k,
+        category=req.category, authority=req.authority, folder=req.folder,
+        user_id=user.get("id"), user_roles=[user.get("role", "")]
+    )
     return {"status": "ok", "data": results}
 
 
 @router.post("/api/search/debug")
-async def api_search_debug(req: SearchReq, user=Depends(get_current_user)):
+async def api_search_debug(req: SearchReq, user=Depends(require_admin)):
     """检索命中测试（调试面板）：返回四路召回明细 + 融合 + rerank 后最终结果。
 
     对标 Dify 知识库「召回测试」：让管理员/用户能客观看到每个 chunk 在哪一路
@@ -38,8 +46,11 @@ async def api_search_debug(req: SearchReq, user=Depends(get_current_user)):
 
 @router.post("/api/files/find")
 async def api_find_files(req: FindFileReq, user=Depends(get_current_user)):
-    """AI 智能找文件：语义检索 → 聚合到文件级 + LLM 推荐理由"""
-    results = await search(req.query, top_k=30)
+    """AI 智能找文件：语义检索 → 聚合到文件级 + LLM 推荐理由
+
+    返回相关文件列表，每个文件附带命中片段和 AI 推荐理由。
+    """
+    results = await search(req.query, top_k=30, user_id=user.get("id"), user_roles=[user.get("role", "")])
     if not results:
         return {"status": "ok", "data": [], "message": "未找到相关文件"}
     # 聚合到文件级

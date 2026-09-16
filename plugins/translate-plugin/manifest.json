@@ -1,0 +1,51 @@
+{
+  "name": "translate-plugin",
+  "version": "1.0.0",
+  "api_version": "1",
+  "kind": "tool",
+  "display_name": "翻译工具",
+  "description": "中英文互译（示例：演示插件写法，实际用 LLM 翻译）",
+  "author": "你自己",
+  "entry": "main.py",
+  "tools": [
+    {
+      "name": "translate",
+      "description": "将文本翻译为目标语言",
+      "parameters_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "待翻译文本",
+            "ui": "textarea"
+          },
+          "source_lang": {
+            "type": "string",
+            "description": "源语言（留空则自动检测）",
+            "default": "auto",
+            "enum": ["auto", "zh", "en", "ja", "ko", "de", "fr", "es", "ru", "ar"]
+          },
+          "target_lang": {
+            "type": "string",
+            "description": "目标语言",
+            "default": "en",
+            "enum": ["zh", "en", "ja", "ko", "de", "fr", "es", "ru", "ar"]
+          }
+        },
+        "required": ["text"],
+        "ui:order": ["text", "source_lang", "target_lang"]
+      }
+    },
+    {
+      "name": "detect_lang",
+      "description": "检测文本语言",
+      "parameters_schema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "待检测文本", "ui": "textarea" }
+        },
+        "required": ["text"]
+      }
+    }
+  ]
+}

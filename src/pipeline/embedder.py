@@ -17,7 +17,10 @@ _embedder = None
 _LOCAL_MODEL_PATH = None
 _LOCAL_MODEL_DIM = None
 # 本地模型不可用缓存：加载失败一次后不再重复尝试（避免流式入库每批都白加载）
+# W7: 添加 TTL，5 分钟后重试本地加载
 _LOCAL_UNAVAILABLE = False
+_LOCAL_UNAVAILABLE_SINCE = 0.0
+_LOCAL_UNAVAILABLE_TTL = 300.0  # 5 分钟后重试
 _LOCAL_CHECKED = False
 _embedder_lock = __import__('threading').Lock()
 
@@ -97,9 +100,14 @@ def _has_weights(model_dir) -> bool:
 
 def _encode_local(texts: list[str], progress_cb=None) -> list[bytes]:
     """本地 sentence-transformers（可选 ONNX INT8 量化加速）"""
-    global _embedder, _LOCAL_MODEL_DIM, _LOCAL_UNAVAILABLE
+    global _embedder, _LOCAL_MODEL_DIM, _LOCAL_UNAVAILABLE, _LOCAL_UNAVAILABLE_SINCE
+    # W7: TTL 重试——超时后重试本地加载
     if _LOCAL_UNAVAILABLE:
-        raise RuntimeError("本地模型不可用（已缓存）")
+        import time
+        if time.monotonic() - _LOCAL_UNAVAILABLE_SINCE < _LOCAL_UNAVAILABLE_TTL:
+            raise RuntimeError("本地模型不可用（已缓存）")
+        logger.info("本地模型 TTL 到期，重试加载")
+        _LOCAL_UNAVAILABLE = False
     if _embedder is None:
         with _embedder_lock:
             if _embedder is None:  # double-checked locking
@@ -216,7 +224,8 @@ def encode(texts: list[str], progress_cb=None, force_remote: bool = False) -> li
             return _encode_local(texts, progress_cb)
         except Exception as e:
             logger.warning(f"本地模型加载失败，降级远程 SiliconFlow: {e}")
-            _LOCAL_UNAVAILABLE = True  # 缓存失败，后续直接远程
+            _LOCAL_UNAVAILABLE = True  # W7: 缓存失败，TTL 后重试
+            _LOCAL_UNAVAILABLE_SINCE = time.monotonic()
     try:
         return _encode_remote(texts, progress_cb)
     except Exception as e:

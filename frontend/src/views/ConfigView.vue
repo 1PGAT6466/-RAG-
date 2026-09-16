@@ -1,5 +1,6 @@
 <template>
   <div class="config-view">
+    <PageBack to="/" label="返回对话" />
     <div class="page-header">
       <div class="page-header-left">
         <h2 class="page-title"><el-icon><Setting /></el-icon>系统配置</h2>
@@ -105,6 +106,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { Refresh, Setting } from '@element-plus/icons-vue'
+import PageBack from '../components/PageBack.vue'
 // ElMessage 由 unplugin-auto-import 自动引入（含样式）
 import EmptyState from '../components/EmptyState.vue'
 import LoadingBlock from '../components/LoadingBlock.vue'
@@ -172,6 +174,8 @@ onMounted(() => {
 <style scoped>
 .config-view {
   padding-bottom: 24px;
+  height: 100%;
+  overflow-y: auto;
 }
 .config-header {
   display: flex;

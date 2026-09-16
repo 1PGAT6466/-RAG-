@@ -56,12 +56,8 @@ PORT = int(_env("PORT", "8099"))
 JWT_SECRET = _resolve_jwt_secret()
 JWT_EXPIRY_HOURS = int(_env("JWT_EXPIRY_HOURS", "24"))
 
-# CORS：逗号分隔的允许来源；默认本地开发地址 + 内网 IP（不允许 allow_origins=* + allow_credentials=True 的危险组合）
-# 内网访问：本机网卡 IP 172.25.30.11（可在 .env 用 CORS_ORIGINS 覆盖追加其他来源）
-_DEFAULT_CORS = (
-    "http://localhost:3000,http://127.0.0.1:3000,"
-    "http://172.25.30.11:3000,http://172.25.30.11:8099"
-)
+# CORS：逗号分隔的允许来源；默认仅 localhost（内网 IP 请在 .env 用 CORS_ORIGINS 配置）
+_DEFAULT_CORS = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8099,http://127.0.0.1:8099"
 CORS_ORIGINS = [o.strip() for o in _env("CORS_ORIGINS", _DEFAULT_CORS).split(",") if o.strip()]
 
 # 路径
@@ -149,6 +145,8 @@ RAG_RERANK = _env("RAG_RERANK", "1")
 # HyDE（Hypothetical Document Embedding）：语义模糊且 BM25/图谱双零召回时，用 LLM 生成
 # 「假设答案」重新向量检索（兜底增强）。默认关闭（与 LLM 减负战略一致，仅在精准场景启用）。
 RAG_HYDE = _env("RAG_HYDE", "0")
+# Multi-query: LLM 改写为多个子查询分别检索后合并（默认关，评测通过再开）
+RAG_MULTI_QUERY = _env("RAG_MULTI_QUERY", "0")
 
 # 图谱检索召回（实体导航，第三个召回源；默认开启，置 0 关闭）
 RAG_GRAPH_RECALL = _env("RAG_GRAPH_RECALL", "1")
@@ -187,6 +185,11 @@ RAG_OCR_DML = _env("RAG_OCR_DML", "1")  # DirectML GPU 加速开关
 # 默认 "0"（关闭）。MinerU 是重型依赖（需 magic_pdf 包 + 模型权重），未安装时自动
 # 降级回 fitz+OCR 链路。启用后仅对「复杂 PDF」走 MinerU，简单 PDF 仍走轻量 fitz。
 RAG_PDF_DEEP_PARSE = _env("RAG_PDF_DEEP_PARSE", "0")  # 0 | 1
+
+# docling PDF 版面分析（可选增强）：用 docling 对 PDF 做结构化版面分析（表格/标题/图片识别）。
+# 默认 "0"（关闭）。docling 是重型依赖（需 pip install docling，~500MB 含 PyTorch），未安装时自动
+# 降级回 fitz+OCR 链路。启用后仅当 docling 产出 ≥50 字时采用，否则降级。
+RAG_DOCLING_PDF = _env("RAG_DOCLING_PDF", "0")  # 0 | 1
 
 # 语言归一化：高置信度繁转简 + 非中文（日/韩/乱码）过滤
 RAG_LANG_FILTER = _env("RAG_LANG_FILTER", "1")

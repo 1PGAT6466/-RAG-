@@ -9,39 +9,48 @@
           <div class="sidebar-sub">工业 RAG 平台</div>
         </div>
       </div>
-      <nav class="sidebar-nav">
+      <nav class="sidebar-nav" role="navigation" aria-label="主导航">
         <div class="nav-group-label">工作台</div>
-        <div class="category-item" :class="{ active: route.path === '/' }" @click="$router.push('/')">
+        <div class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/' }" @click="navigateTo('/')" @keydown.enter="navigateTo('/')" @keydown.space.prevent="navigateTo('/')">
           <el-icon><ChatDotRound /></el-icon> 对话
         </div>
-        <div class="category-item" :class="{ active: route.path.startsWith('/documents') }" @click="$router.push('/documents')">
+        <div class="category-item" tabindex="0" role="link" :class="{ active: route.path.startsWith('/documents') }" @click="navigateTo('/documents')" @keydown.enter="navigateTo('/documents')" @keydown.space.prevent="navigateTo('/documents')">
           <el-icon><Folder /></el-icon> {{ auth.isAdmin ? '文档管理' : '文档浏览' }}
         </div>
-        <div class="category-item" :class="{ active: route.path === '/graph' }" @click="$router.push('/graph')">
+        <div class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/graph' }" @click="navigateTo('/graph')" @keydown.enter="navigateTo('/graph')" @keydown.space.prevent="navigateTo('/graph')">
           <el-icon><Connection /></el-icon> 知识图谱
         </div>
-        <div class="category-item" :class="{ active: route.path === '/debug' }" @click="$router.push('/debug')">
+        <div class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/debug' }" @click="navigateTo('/debug')" @keydown.enter="navigateTo('/debug')" @keydown.space.prevent="navigateTo('/debug')">
           <el-icon><Aim /></el-icon> 检索调试
         </div>
         <!-- 仅管理员可见：插件管理 -->
-        <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/plugins' }" @click="$router.push('/plugins')">
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/plugins' }" @click="navigateTo('/plugins')" @keydown.enter="navigateTo('/plugins')" @keydown.space.prevent="navigateTo('/plugins')">
           <el-icon><Grid /></el-icon> 插件
         </div>
-        <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/mcp' }" @click="$router.push('/mcp')">
-          <el-icon><Shop /></el-icon> MCP 市场
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/mcp' }" @click="navigateTo('/mcp')" @keydown.enter="navigateTo('/mcp')" @keydown.space.prevent="navigateTo('/mcp')">
+          <el-icon><Connection /></el-icon> MCP 市场
         </div>
-        <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/dms' }" @click="$router.push('/dms')">
-          <el-icon><Download /></el-icon> DMS 文档源
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/dms' }" @click="navigateTo('/dms')" @keydown.enter="navigateTo('/dms')" @keydown.space.prevent="navigateTo('/dms')">
+          <el-icon><FolderOpened /></el-icon> DMS 文档源
         </div>
-        <div v-if="auth.isAdmin" class="category-item" :class="{ active: route.path === '/config' }" @click="$router.push('/config')">
+        <div class="category-item" tabindex="0" role="link" :class="{ active: route.path.startsWith('/wiki') }" @click="navigateTo('/wiki')" @keydown.enter="navigateTo('/wiki')" @keydown.space.prevent="navigateTo('/wiki')">
+          <el-icon><Notebook /></el-icon> Wiki 知识页
+        </div>
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/config' }" @click="navigateTo('/config')" @keydown.enter="navigateTo('/config')" @keydown.space.prevent="navigateTo('/config')">
           <el-icon><Setting /></el-icon> 系统配置
+        </div>
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/recycle-bin' }" @click="navigateTo('/recycle-bin')" @keydown.enter="navigateTo('/recycle-bin')" @keydown.space.prevent="navigateTo('/recycle-bin')">
+          <el-icon><Delete /></el-icon> 回收站
+        </div>
+        <div v-if="auth.isAdmin" class="category-item" tabindex="0" role="link" :class="{ active: route.path === '/audit' }" @click="navigateTo('/audit')" @keydown.enter="navigateTo('/audit')" @keydown.space.prevent="navigateTo('/audit')">
+          <el-icon><List /></el-icon> 审计日志
         </div>
         <div style="margin-top:24px;border-top:1px solid var(--border);padding-top:12px">
           <div class="user-badge" :class="{ 'user-badge--admin': auth.isAdmin }">
             <span class="user-avatar">{{ (auth.username || '?')[0] }}</span>
             {{ auth.username }} · {{ auth.isAdmin ? '管理员' : '用户' }}
           </div>
-          <div class="category-item" @click="handleLogout">
+          <div class="category-item" tabindex="0" role="link" @click="handleLogout" @keydown.enter="handleLogout" @keydown.space.prevent="handleLogout">
             <el-icon><SwitchButton /></el-icon> 退出
           </div>
         </div>
@@ -50,7 +59,11 @@
 
     <!-- 主内容 -->
     <main class="main-content">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <transition name="page-fade" mode="out-in">
+          <component :is="Component" />
+        </transition>
+      </router-view>
     </main>
   </div>
 </template>
@@ -62,6 +75,10 @@ import { useAuthStore } from '../stores/auth'
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+
+const navigateTo = (path) => {
+  router.push(path)
+}
 
 function handleLogout() {
   auth.logout()

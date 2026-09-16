@@ -1,4 +1,4 @@
-"""
+﻿"""
 MCP 市场元数据中文化翻译层
 ==========================
 
@@ -243,10 +243,19 @@ def _translate_worker():
         # 队列空了稍等，避免空转
         time.sleep(0.2)
 
+    # S23: 关闭 thread-local 的 SQLite 连接，避免泄漏
+    conn = getattr(_conn_local, "conn", None)
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _conn_local.conn = None
+
 
 def _llm_translate_batch(texts: list[str]) -> dict[str, str]:
     """用 DeepSeek flash 批量翻译，返回 {原文: 译文}，失败返回空 dict。"""
-    from src.llm import call_llm_sync
+    from src.llm_client import call_llm_sync
 
     uniq = list(dict.fromkeys(t for t in texts if t and t.strip() and not _is_zh(t)))
     if not uniq:

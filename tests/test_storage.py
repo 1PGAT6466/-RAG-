@@ -80,16 +80,23 @@ class TestFiles:
         assert len(files) >= 2
 
     def test_delete_file_cleans_chunks(self):
-        from src.storage.files import add_file, delete_file, get_file
+        """P23: 软删除后 get_file 返回 None，但 chunks 保留（可恢复）"""
+        from src.storage.files import add_file, delete_file, get_file, restore_file
         from src.storage.connection import _get_conn
         fid = add_file("del.pdf", "/del.pdf", ".pdf", 100)
         conn = _get_conn()
         conn.execute("INSERT INTO chunks (file_id, chunk_index, content) VALUES (?,?,?)", (fid, 0, "hello"))
         conn.commit()
+
+        # 软删除：get_file 返回 None，chunks 保留
         delete_file(fid)
         assert get_file(fid) is None
         chunks = conn.execute("SELECT * FROM chunks WHERE file_id=?", (fid,)).fetchall()
-        assert len(chunks) == 0
+        assert len(chunks) == 1  # P23: chunks 保留
+
+        # 恢复后可见
+        assert restore_file(fid) is True
+        assert get_file(fid) is not None
 
     def test_update_file_category(self):
         from src.storage.files import add_file, get_file, update_file_category

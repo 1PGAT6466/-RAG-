@@ -14,8 +14,12 @@
           v-for="c in conversations"
           :key="c.id"
           class="conversation-item"
+          tabindex="0"
+          role="button"
           :class="{ active: activeConversationId === c.id }"
           @click="openConversation(c.id)"
+          @keydown.enter="openConversation(c.id)"
+          @keydown.space.prevent="openConversation(c.id)"
         >
           <div class="conversation-title">{{ c.title }}</div>
           <div class="conversation-meta">
@@ -28,7 +32,7 @@
 
     <!-- 右侧对话区 -->
     <div class="chat-container">
-      <div class="chat-messages" ref="msgContainer">
+      <div class="chat-messages" ref="msgContainer" role="log" aria-live="polite" aria-label="对话消息">
         <div class="chat-messages-inner">
         <div v-if="messages.length === 0" class="chat-empty">
           <div class="chat-empty-mark">
@@ -38,9 +42,9 @@
           <div class="chat-empty-title">开始与伏羲对话</div>
           <p class="chat-empty-sub">支持自动检索知识库、联网搜索、自由闲聊三种模式</p>
           <div class="chat-empty-chips">
-            <span class="chat-empty-chip" @click="quickAsk('什么是阻抗匹配？')">🔍 什么是阻抗匹配？</span>
-            <span class="chat-empty-chip" @click="quickAsk('FAKRA 连接器的选型要点')">📄 FAKRA 连接器的选型要点</span>
-            <span class="chat-empty-chip" @click="quickAsk('镀金层厚度标准')">📐 镀金层厚度标准</span>
+            <span class="chat-empty-chip" tabindex="0" role="button" @click="quickAsk('什么是阻抗匹配？')" @keydown.enter="quickAsk('什么是阻抗匹配？')" @keydown.space.prevent="quickAsk('什么是阻抗匹配？')">🔍 什么是阻抗匹配？</span>
+            <span class="chat-empty-chip" tabindex="0" role="button" @click="quickAsk('FAKRA 连接器的选型要点')" @keydown.enter="quickAsk('FAKRA 连接器的选型要点')" @keydown.space.prevent="quickAsk('FAKRA 连接器的选型要点')">📄 FAKRA 连接器的选型要点</span>
+            <span class="chat-empty-chip" tabindex="0" role="button" @click="quickAsk('镀金层厚度标准')" @keydown.enter="quickAsk('镀金层厚度标准')" @keydown.space.prevent="quickAsk('镀金层厚度标准')">📐 镀金层厚度标准</span>
           </div>
         </div>
         <div v-for="(msg, i) in messages" :key="i" class="message" :class="msg.role">
@@ -74,10 +78,10 @@
 
             <!-- 对话操作条：重新生成 / 复制 / 赞 / 踩（仅 assistant 消息） -->
             <div v-if="msg.role === 'assistant' && msg.content && !loading" class="message-actions">
-              <button class="msg-action" title="重新生成" @click="regenerate(i)">
+              <button class="msg-action" title="重新生成" aria-label="重新生成" @click="regenerate(i)">
                 <el-icon><Refresh /></el-icon><span>重新生成</span>
               </button>
-              <button class="msg-action" title="复制" @click="copyAnswer(msg)">
+              <button class="msg-action" title="复制" aria-label="复制" @click="copyAnswer(msg)">
                 <el-icon><Document /></el-icon><span>复制</span>
               </button>
               <span class="msg-action-sep"></span>
@@ -85,6 +89,7 @@
                 class="msg-action msg-action--vote"
                 :class="{ active: msg._feedback === 'up' }"
                 title="回答有帮助"
+                aria-label="赞"
                 @click="vote(msg, 'up')"
               >
                 <el-icon><Top /></el-icon>
@@ -93,6 +98,7 @@
                 class="msg-action msg-action--vote"
                 :class="{ active: msg._feedback === 'down' }"
                 title="回答不准确"
+                aria-label="踩"
                 @click="vote(msg, 'down')"
               >
                 <el-icon><Bottom /></el-icon>
@@ -105,7 +111,7 @@
             <div class="message-meta-row">
               <span class="message-role-label assistant">伏羲</span>
             </div>
-            <div class="message-content message-content--loading">思考中...</div>
+            <div class="message-content message-content--loading"><span class="thinking-dots">思考中</span></div>
           </div>
         </div>
         </div>
@@ -120,6 +126,15 @@
               <el-radio-button value="chat">闲聊</el-radio-button>
               <el-radio-button value="web">联网</el-radio-button>
             </el-radio-group>
+            <!-- P12: 知识库模式下的检索筛选器 -->
+            <div v-if="mode === 'knowledge'" class="search-filters">
+              <el-select v-model="filterCategory" placeholder="分类" clearable size="small" style="width: 120px">
+                <el-option v-for="c in categories" :key="c" :label="c" :value="c" />
+              </el-select>
+              <el-select v-model="filterFolder" placeholder="文件夹" clearable size="small" style="width: 140px">
+                <el-option v-for="f in folders" :key="f" :label="f" :value="f" />
+              </el-select>
+            </div>
           </div>
           <div class="chat-input-box">
             <textarea
@@ -135,7 +150,8 @@
               class="chat-send-btn"
               :disabled="loading || !query.trim()"
               @click="send"
-              :title="'发送'">
+              :title="'发送'"
+              aria-label="发送消息">
               <el-icon><Promotion /></el-icon>
             </button>
           </div>
@@ -156,6 +172,8 @@ import { Promotion, Plus, Delete, Top, Bottom } from '@element-plus/icons-vue'
 // ElMessage/ElMessageBox 由 unplugin-auto-import 自动引入（含样式），无需显式 import
 import { renderAnswer } from './chat/markdown'
 import { formatTime, extractChunkIds, autoGrow } from './chat/helpers'
+import { friendlyError } from '../utils/errors'
+import { confirmDelete } from '../utils/confirm'
 import api from '../api'
 import feedbackApi from '../api/feedback'
 
@@ -166,8 +184,31 @@ const msgContainer = ref(null)
 const router = useRouter()
 const route = useRoute()
 const mode = ref('auto')
+// P12: 检索筛选器
+const filterCategory = ref('')
+const filterFolder = ref('')
+const categories = ref([])
+const folders = ref([])
+
+// 加载分类和文件夹选项
+async function loadFilterOptions() {
+  try {
+    const { data } = await api.get('/documents')
+    if (data.data) {
+      const cats = new Set()
+      const flds = new Set()
+      data.data.forEach(f => {
+        if (f.category && f.category !== '未分类') cats.add(f.category)
+        if (f.folder) flds.add(f.folder)
+      })
+      categories.value = [...cats].sort()
+      folders.value = [...flds].sort()
+    }
+  } catch {}
+}
+loadFilterOptions()
 const modeHint = computed(() => {
-  const m = { auto: '自动：智能判断检索/联网/闲聊', knowledge: '知识库：仅检索本地文档', chat: '闲聊：自由对话', web: '联网：实时信息' }
+  const m = { auto: '自动：智能判断检索/联网/闲聊', knowledge: '知识库：仅检索本地文档', chat: '闲聊：自由对话', web: '联网：实时信息', meta: '元查询：知识库信息' }
   return m[mode.value] || ''
 })
 const inputPlaceholder = computed(() => {
@@ -181,6 +222,7 @@ const activeConversationId = ref(null)
 
 // 每个引用编号 → 对应卡片 DOM（用于脚注点击滚动定位）
 const sourceEls = {}
+let abortController = null  // SSE 请求取消控制器
 const currentSources = ref([])
 
 function setSourceRef(s, el) {
@@ -188,18 +230,27 @@ function setSourceRef(s, el) {
 }
 
 
-// 预渲染 HTML 缓存（每条消息只解析一次，避免消息列表增长后每次渲染重算全部历史）
-const renderedHtml = computed(() => {
-  const map = new Map()
-  messages.value.forEach((msg, i) => {
-    map.set(i, renderAnswer(msg))
-  })
-  return map
-})
+// 预渲染 HTML 增量缓存（每条消息只解析一次，新消息追加时只渲染新增部分）
+let _htmlCache = new Map()
+let _lastRenderedCount = 0
 
-// 按下标取缓存（供模板 v-html）
 function htmlFor(i) {
-  return renderedHtml.value.get(i) || ''
+  const msgs = messages.value
+  // 增量渲染：只处理 i >= _lastRenderedCount 的新消息
+  if (i >= _lastRenderedCount) {
+    for (let j = _lastRenderedCount; j < msgs.length; j++) {
+      if (!_htmlCache.has(j)) {
+        _htmlCache.set(j, renderAnswer(msgs[j]))
+      }
+    }
+    _lastRenderedCount = msgs.length
+  }
+  return _htmlCache.get(i) || ''
+}
+
+function resetHtmlCache() {
+  _htmlCache = new Map()
+  _lastRenderedCount = 0
 }
 
 // 脚注点击：滚动到对应引用卡片
@@ -240,7 +291,11 @@ onMounted(() => {
     if (cid) openConversation(cid)
   }
 })
-onUnmounted(() => window.removeEventListener('jump-source', onJumpSource))
+onUnmounted(() => {
+  window.removeEventListener('jump-source', onJumpSource)
+  if (abortController) { abortController.abort(); abortController = null }
+  delete window.__jumpToSource
+})
 function onJumpSource(e) {
   jumpToSource(e.detail)
 }
@@ -258,6 +313,8 @@ async function fetchConversations() {
 function newConversation() {
   activeConversationId.value = null
   messages.value = []
+  Object.keys(sourceEls).forEach(k => delete sourceEls[k])
+  resetHtmlCache()
 }
 
 // 空状态快捷提问：填入输入框并直接发送
@@ -268,6 +325,8 @@ function quickAsk(q) {
 
 async function openConversation(id) {
   activeConversationId.value = id
+  Object.keys(sourceEls).forEach(k => delete sourceEls[k])
+  resetHtmlCache()
   try {
     const { data } = await api.get(`/conversations/${id}`)
     const msgs = data.data.messages || []
@@ -278,13 +337,13 @@ async function openConversation(id) {
     }))
     await scrollToBottom()
   } catch (e) {
-    ElMessage.error('加载会话失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('加载会话失败: ' + friendlyError(e))
   }
 }
 
 async function deleteConversation(id) {
   try {
-    await ElMessageBox.confirm('删除该会话？', '提示', { type: 'warning' })
+    await confirmDelete('确定要删除该会话吗？')
   } catch {
     return
   }
@@ -297,13 +356,16 @@ async function deleteConversation(id) {
     }
     await fetchConversations()
   } catch (e) {
-    ElMessage.error('删除失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('删除失败: ' + friendlyError(e))
   }
 }
 
 async function send() {
   const q = query.value.trim()
   if (!q || loading.value) return
+  // 取消上一次未完成的 SSE 请求
+  if (abortController) abortController.abort()
+  abortController = new AbortController()
   messages.value.push({ role: 'user', content: q, ts: Date.now() })
   query.value = ''
   loading.value = true
@@ -327,11 +389,12 @@ async function send() {
   const history = messages.value.slice(0, -1).slice(-10).map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content }))
   try {
     // knowledge 模式走 SSE 流式，其余走普通 POST
-    if (mode.value === 'knowledge' || mode.value === 'auto') {
+    if (mode.value === 'knowledge' || mode.value === 'auto' || mode.value === 'meta') {
       const resp = await fetch('/api/chat/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${localStorage.getItem('token')}` },
-        body: JSON.stringify({ query: q, top_k: 10, mode: mode.value, history, conversation_id: cid }),
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${sessionStorage.getItem('token')}` },
+        body: JSON.stringify({ query: q, top_k: 10, mode: mode.value, history, conversation_id: cid, category: filterCategory.value, folder: filterFolder.value }),
+        signal: abortController.signal,
       })
       if (!resp.ok) throw new Error(await resp.text())
       const reader = resp.body.getReader()
@@ -389,9 +452,11 @@ async function send() {
     // 刷新会话列表（标题/消息数/排序已更新）
     fetchConversations()
   } catch (e) {
-    messages.value.push({ role: 'assistant', content: '抱歉，请求失败: ' + (e.response?.data?.detail || e.message) })
+    if (e.name === 'AbortError') return  // 用户主动取消，静默退出
+    messages.value.push({ role: 'assistant', content: '抱歉，请求失败: ' + friendlyError(e) })
   } finally {
     loading.value = false
+    abortController = null
     await scrollToBottom()
   }
 }
@@ -459,7 +524,7 @@ async function vote(msg, kind) {
       ElMessage.success(kind === 'up' ? '已记录：有帮助' : '已记录：不准确')
     }
   } catch (e) {
-    ElMessage.error('反馈失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('反馈失败: ' + friendlyError(e))
   }
 }
 </script>
@@ -501,7 +566,7 @@ async function vote(msg, kind) {
 .chat-input-area {
   flex-shrink: 0;
   padding: 14px 20px 10px;
-  background: rgba(255,255,255,0.55);
+  background: var(--bg-secondary, #f5f6f8);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-top: 1px solid var(--border);
@@ -515,6 +580,14 @@ async function vote(msg, kind) {
   margin-bottom: 10px;
   display: flex;
   justify-content: flex-start;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.search-filters {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 /* 精致的玻璃输入框 */
@@ -524,11 +597,11 @@ async function vote(msg, kind) {
   gap: 10px;
   padding: 8px 8px 8px 16px;
   border-radius: 16px;
-  background: linear-gradient(150deg, rgba(255,255,255,0.85), rgba(255,255,255,0.6));
+  background: var(--bg-secondary, #f5f6f8);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255,255,255,0.7);
-  box-shadow: 0 4px 20px rgba(31,45,41,0.08), inset 0 1px 0 rgba(255,255,255,0.9);
+  border: 1px solid var(--border, #e5e7ec);
+  box-shadow: 0 2px 8px rgba(31,45,41,0.04);
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 .chat-input-box:focus-within {
@@ -565,7 +638,7 @@ async function vote(msg, kind) {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, #13a89e 0%, #0e6e6a 100%);
+  background: linear-gradient(135deg, var(--accent-mid, #13a89e) 0%, var(--accent) 100%);
   color: #fff;
   font-size: 18px;
   box-shadow: 0 4px 12px rgba(14,110,106,0.28);
@@ -784,11 +857,10 @@ async function vote(msg, kind) {
   border-radius: 14px;
   line-height: 1.7;
   font-size: 14px;
-  background: linear-gradient(150deg, rgba(255,255,255,0.78), rgba(255,255,255,0.52));
-  backdrop-filter: blur(16px) saturate(150%);
-  -webkit-backdrop-filter: blur(16px) saturate(150%);
-  border: 1px solid rgba(255,255,255,0.7);
-  box-shadow: 0 4px 18px rgba(31,45,41,0.07), inset 0 1px 0 rgba(255,255,255,0.95);
+  background: var(--bg-secondary, #f5f6f8);
+  border: 1px solid var(--border, #e5e7ec);
+  box-shadow: 0 2px 8px rgba(31,45,41,0.04);
+  color: var(--text-primary);
 }
 .message.user .message-content {
   background: linear-gradient(135deg, rgba(14,110,106,0.92), rgba(11,79,76,0.92));
@@ -797,11 +869,22 @@ async function vote(msg, kind) {
   box-shadow: 0 6px 18px rgba(14,110,106,0.24), inset 0 1px 0 rgba(255,255,255,0.15);
 }
 .message.assistant .message-content {
-  box-shadow: 0 4px 18px rgba(31,45,41,0.07), inset 0 1px 0 rgba(255,255,255,0.95);
+  box-shadow: 0 2px 8px rgba(31,45,41,0.04);
 }
 .message-content--loading {
   color: var(--text-tertiary);
   white-space: nowrap;
+}
+
+.thinking-dots::after {
+  content: '';
+  animation: dots 1.5s steps(4, end) infinite;
+}
+@keyframes dots {
+  0%, 20% { content: ''; }
+  40% { content: '.'; }
+  60% { content: '..'; }
+  80%, 100% { content: '...'; }
 }
 
 :deep(.cite-mark) {

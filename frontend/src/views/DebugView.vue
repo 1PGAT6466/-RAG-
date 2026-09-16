@@ -1,5 +1,6 @@
 <template>
   <div class="debug-page">
+    <PageBack to="/" label="返回对话" />
     <div class="page-header">
       <div class="page-title">
         <el-icon class="page-title-icon"><Aim /></el-icon>
@@ -93,6 +94,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { Aim, Search } from '@element-plus/icons-vue'
+import PageBack from '../components/PageBack.vue'
 import searchApi from '../api/search'
 
 const query = ref('')

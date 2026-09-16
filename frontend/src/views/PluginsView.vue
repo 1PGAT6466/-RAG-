@@ -1,5 +1,6 @@
 <template>
   <div class="plugins-view">
+    <PageBack to="/" label="返回对话" />
     <!-- 顶部标题栏 -->
     <div class="page-header">
       <div class="page-header-left">
@@ -103,6 +104,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { Refresh, Grid } from '@element-plus/icons-vue'
+import PageBack from '../components/PageBack.vue'
 import EmptyState from '../components/EmptyState.vue'
 // ElMessage/ElMessageBox 由 unplugin-auto-import 自动引入（含样式）
 import { usePluginsStore } from '../stores/plugins'

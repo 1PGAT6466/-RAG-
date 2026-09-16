@@ -1,5 +1,6 @@
 <template>
   <div class="graph-page">
+    <PageBack to="/" label="返回对话" />
     <!-- 顶部 Tab 切换：双图谱 -->
     <div class="graph-tabs">
       <el-radio-group v-model="mode" size="large">
@@ -48,7 +49,7 @@
                 size="small"
                 :color="nodeColor(e)"
                 effect="plain"
-                style="border:none;cursor:pointer;color:#333"
+                style="border:none;cursor:pointer;color:var(--text-primary)"
                 @click="openEntityDetail(e.id, e.name)"
               >
                 {{ e.name }}
@@ -58,7 +59,7 @@
         </div>
       </div>
 
-      <canvas v-if="mode !== 'timeline'" ref="canvasEl"></canvas>
+      <canvas v-if="mode !== 'timeline'" ref="canvasEl" role="img" aria-label="知识图谱可视化"></canvas>
       <div v-if="graphTruncated" class="graph-truncated-hint">
         节点过多，已按关联度显示 Top {{ MAX_GRAPH_NODES }} 核心节点，可用上方筛选缩小范围
       </div>
@@ -118,7 +119,9 @@
             <span v-if="selectedEntity.in_degree !== undefined" style="margin-left:12px;color:var(--text-secondary)">入 {{ selectedEntity.in_degree }} / 出 {{ selectedEntity.out_degree }}</span>
           </el-descriptions-item>
           <el-descriptions-item v-if="selectedEntity.created_at" label="入库时间">{{ selectedEntity.created_at }}</el-descriptions-item>
-          <el-descriptions-item v-if="selectedEntity.description" label="描述">{{ selectedEntity.description }}</el-descriptions-item>
+          <el-descriptions-item v-if="selectedEntity.description" label="描述">
+            <span style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block">{{ selectedEntity.description }}</span>
+          </el-descriptions-item>
           <el-descriptions-item v-if="selectedEntity.attributes && selectedEntity.attributes !== '{}'" label="属性">
             <pre style="margin:0;font-size:12px;white-space:pre-wrap">{{ prettyAttr(selectedEntity.attributes) }}</pre>
           </el-descriptions-item>
@@ -169,9 +172,11 @@
 import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import * as d3 from 'd3'
 import { useRouter } from 'vue-router'
-import { Loading, Share, Connection, Back } from '@element-plus/icons-vue'
+import { Share, Back } from '@element-plus/icons-vue'
+import PageBack from '../components/PageBack.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingBlock from '../components/LoadingBlock.vue'
+import { friendlyError } from '../utils/errors'
 import api from '../api'
 import {
   TYPE_COLORS, STD_CATEGORY_COLORS, TYPE_LABELS, DOC_COLORS,
@@ -255,7 +260,14 @@ watch(activeRelTypes, () => { applyEdgeFilter(); renderGraph() })
 watch(hideCooccur, () => { applyEdgeFilter(); renderGraph() })
 watch(showLabels, () => renderGraph())
 
+let _graphAbortController = null
+
 async function fetchGraph() {
+  // 取消上一次未完成的请求
+  if (_graphAbortController) _graphAbortController.abort()
+  _graphAbortController = new AbortController()
+  const signal = _graphAbortController.signal
+
   // 时间轴视图：加载实体并按入库时间分组，不走画布渲染
   if (mode.value === 'timeline') {
     loading.value = false
@@ -265,7 +277,7 @@ async function fetchGraph() {
   loading.value = true
   try {
     if (mode.value === 'document') {
-      const { data } = await api.get('/graph')
+      const { data } = await api.get('/graph', { signal })
       nodes.value = data.data.nodes || []
       // 文档图边字段映射：source_id/target_id → source/target（d3 forceLink 约定）
       edges.value = (data.data.edges || []).map(e => ({
@@ -276,7 +288,7 @@ async function fetchGraph() {
       buildDocLegend()
     } else {
       // 实体图：全量拉取，筛选在前端本地做（支持 standard 按 category 细分）
-      const { data } = await api.get('/entities/graph')
+      const { data } = await api.get('/entities/graph', { signal })
       allNodes.value = data.data.nodes || []
       // 实体图边字段映射：source_id/target_id → source/target（d3 forceLink 约定）
       allEdges.value = (data.data.edges || []).map(e => ({
@@ -294,8 +306,9 @@ async function fetchGraph() {
     await nextTick()
     renderGraph()
   } catch (e) {
+    if (e.name === 'AbortError') return
     console.error('图谱加载失败', e)
-    ElMessage.error('图谱加载失败：' + (e.response?.data?.detail || e.message))
+    ElMessage.error('图谱加载失败：' + friendlyError(e))
     nodes.value = []
     edges.value = []
   } finally {
@@ -332,7 +345,7 @@ async function fetchTimeline() {
     edges.value = []
   } catch (e) {
     console.error('时间轴加载失败', e)
-    ElMessage.error('时间轴加载失败：' + (e.response?.data?.detail || e.message))
+    ElMessage.error('时间轴加载失败：' + friendlyError(e))
     timelineGroups.value = []
   } finally {
     timelineLoading.value = false
@@ -448,9 +461,25 @@ function applyNodeFilter() {
   })
 }
 
+/**
+ * renderGraph — Canvas 力导向图渲染器
+ *
+ * 核心流程：
+ * 1. 将 nodes/edges 映射为 d3 forceSimulation 数据
+ * 2. 绑定 Canvas 交互事件（拖拽节点 / 平移画布 / 缩放 / hover 高亮）
+ * 3. 用 requestAnimationFrame 节流重绘，避免超过 60fps
+ *
+ * 状态机：dragMode = null | 'node' | 'pan'
+ *   - mousedown 检测 hit-test → 决定进入 node 拖拽还是 pan
+ *   - mousemove 根据 dragMode 更新 fx/fy 或 transform
+ *   - mouseup 判断 moved → 若未移动则触发点击跳转
+ */
 function renderGraph() {
   const canvas = canvasEl.value
-  if (!canvas || nodes.value.length === 0) return
+  if (!canvas || nodes.value.length === 0) {
+    if (graphCleanup) { graphCleanup(); graphCleanup = null }
+    return
+  }
 
   // 清理上一次渲染绑定的全局监听器（避免重复绑定导致拖拽/点击叠加）
   if (graphCleanup) { graphCleanup(); graphCleanup = null }
@@ -823,7 +852,7 @@ async function expandLocalGraph() {
     ElMessage.success(`已展开「${selectedEntity.value.name}」的 ${hops} 跳局部图谱（${g.nodes.length} 节点 / ${g.edges.length} 边）${truncMsg}`)
   } catch (e) {
     console.error('局部图谱加载失败', e)
-    ElMessage.error('局部图谱加载失败：' + (e.response?.data?.detail || e.message))
+    ElMessage.error('局部图谱加载失败：' + friendlyError(e))
   }
 }
 
@@ -845,7 +874,7 @@ async function backToFullGraph() {
 .graph-tabs {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
   padding: 14px 20px;
   background: var(--bg-primary);
   border-bottom: 1px solid var(--border);
@@ -1022,5 +1051,12 @@ async function backToFullGraph() {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+/* drawer 实体名截断 */
+:deep(.el-drawer__title) {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

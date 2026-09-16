@@ -163,10 +163,14 @@ async def get_server_full(qualified_name: str) -> dict | None:
 
 
 def resolve_mcp_url(qualified_name: str, namespace: str = "") -> str:
-    """推算 remote server 的公开直连 MCP URL。
+    """推算 remote server 的公开直连 MCP URL（启发式推算，非官方保证）。
 
     Smithery 部分 server（如 exa）提供 https://mcp.<namespace>.ai 公开端点；
     大多数 remote server 的 deploymentUrl（.run.tools）需 Smithery OAuth，不能直连。
+    注意：此 URL 是启发式推算，实际可用性取决于 server 是否暴露公开端点。
     """
+    import re
     ns = namespace or qualified_name.split("/")[0]
+    # S11: 对 namespace 做基础清理，只保留安全字符
+    ns = re.sub(r'[^a-z0-9-]', '', ns.lower())
     return f"https://mcp.{ns}.ai"

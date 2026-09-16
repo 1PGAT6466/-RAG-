@@ -57,6 +57,38 @@ def _use_hyde() -> bool:
     return RAG_HYDE == "1"
 
 
+def _use_multi_query() -> bool:
+    """是否启用 multi-query 改写检索（默认关闭）"""
+    from config import RAG_MULTI_QUERY
+    return RAG_MULTI_QUERY == "1"
+
+
+async def _generate_multi_queries(query: str, max_queries: int = 3) -> list[str]:
+    """用 LLM 将模糊 query 改写为多个子查询（multi-query 核心）。
+
+    返回 [query1, query2, ...]（不含原始 query），失败返回空列表。
+    """
+    try:
+        from src.chat.engine import _call_llm_with_fallback
+        prompt = (
+            "你是一个检索改写助手。用户的问题可能模糊或口语化。"
+            "请将以下问题改写为 2-3 个不同角度的技术查询，每行一个，不要编号：\n"
+            f"{query}"
+        )
+        resp = await _call_llm_with_fallback([
+            {"role": "user", "content": prompt}
+        ], max_tokens=200)
+        if not resp or len(resp.strip()) < 5:
+            return []
+        queries = [q.strip() for q in resp.strip().split("\n") if q.strip() and len(q.strip()) > 2]
+        # 过滤掉与原始 query 完全相同的
+        queries = [q for q in queries if q != query]
+        return queries[:max_queries]
+    except Exception as e:
+        logger.warning(f"multi-query 改写失败: {e}")
+        return []
+
+
 def _route_query(query: str) -> str:
     """Query 路由（显式化）：判断 query 类型，决定最优召回策略（可观测信号）。
 
@@ -90,11 +122,18 @@ def _route_query(query: str) -> str:
     # 语义模糊（对比/区别/原理/为什么）
     if any(k in q_lower for k in ("区别", "对比", "原理", "为什么", "优缺点", "是什么", "含义")):
         return "semantic"
+    # 复合查询（包含多个独立主题，如"A 的 X 和 B 的 Y"）
+    if "和" in query and len(query) > 20:
+        parts = query.split("和")
+        if len(parts) == 2 and len(parts[0].strip()) > 4 and len(parts[1].strip()) > 4:
+            return "complex"
     return "general"
 
 
 async def search(query: str, top_k: int = None, with_rerank: bool = True,
-                 collect_detail: bool = False) -> list[dict]:
+                 collect_detail: bool = False,
+                 category: str = None, authority: int = None, folder: str = None,
+                 user_id: int = None, user_roles: list[str] = None) -> list[dict]:
     """
     混合检索：BM25 + 向量 → 动态加权 RRF 融合 → 精确/分类加权 → Rerank 精排
     返回 [{id, content, file_name, file_id, score, source}, ...]
@@ -109,6 +148,8 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
     global _last_profile
     if top_k is None:
         top_k = SEARCH_TOP_K
+
+    logger.warning(f"[SEARCH_DEBUG] query={query!r} len={len(query)} top_k={top_k}")
 
     # 阶段级耗时打点（可观测性地基，零副作用）
     _t0 = time.perf_counter()
@@ -141,6 +182,29 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
     filename_results = _filename_recall(query, limit=GRAPH_RECALL_LIMIT)
     _stages["filename"] = round((time.perf_counter() - _t) * 1000, 1)
 
+    # 3.6 Multi-query：LLM 改写为多个子查询分别检索后合并（默认关）
+    if _use_multi_query():
+        _t = time.perf_counter()
+        alt_queries = await _generate_multi_queries(query)
+        if alt_queries:
+            _mq_bm25 = []
+            _mq_vec = []
+            for aq in alt_queries:
+                _mq_bm25.extend(_bm25_search(aq, limit=BM25_RECALL_LIMIT // 2))
+                _mq_vec.extend(_vector_search(aq, limit=VECTOR_RECALL_LIMIT // 2))
+            # 合并到主召回池（去重后再进融合）
+            _seen_ids = {r["id"] for r in bm25_results + vec_results}
+            for r in _mq_bm25 + _mq_vec:
+                if r["id"] not in _seen_ids:
+                    _seen_ids.add(r["id"])
+                    if r in _mq_bm25:
+                        bm25_results.append(r)
+                    else:
+                        vec_results.append(r)
+            _stages["multi_query"] = round((time.perf_counter() - _t) * 1000, 1)
+            _stages["mq_queries"] = len(alt_queries)
+            logger.info(f"multi-query 改写 {len(alt_queries)} 条, BM25+{len(_mq_bm25)}, Vec+{len(_mq_vec)}")
+
     # debug 模式：暂存四路召回明细（仅 collect_detail=True 时，零副作用）
     if collect_detail:
         _recalls_detail = {
@@ -160,6 +224,7 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
             hyde_results = await _hyde_retrieve(query, top_k=top_k)
             if hyde_results:
                 _stages["hyde"] = round((time.perf_counter() - _t0) * 1000, 1)
+                _stages["total"] = _stages["hyde"]  # ← Critical fix: 补上 total，避免 KeyError
                 _last_profile = {"query": query[:50], "top_k": top_k,
                                  "total_ms": _stages["total"], "stages": _stages}
                 logger.info(f"HyDE 兜底召回 {len(hyde_results)} 条: query={query[:40]!r}")
@@ -224,7 +289,18 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
             logger.warning(f"精确命中保护失败（已忽略）: {e}")
     _stages["recover"] = round((time.perf_counter() - _t) * 1000, 1)
 
-    # 4.6 最终截断到 top_k（rerank 用了更大候选池，这里收敛）
+    # 4.6 元数据过滤（category/authority/folder）— 在截断前执行，避免过滤后结果不足 top_k
+    if category or authority is not None or folder:
+        merged = _apply_metadata_filter(merged, category=category, authority=authority, folder=folder)
+
+    # P3: 文件级权限过滤（同样在截断前执行）
+    if user_id:
+        from src.storage.permissions import get_user_accessible_file_ids
+        allowed = get_user_accessible_file_ids(user_id, user_roles)
+        if allowed is not None:
+            merged = [r for r in merged if r.get("file_id") in allowed]
+
+    # 最终截断到 top_k
     merged = merged[:top_k]
 
     logger.info(f"检索完成: query='{query[:50]}', results={len(merged)}")
@@ -257,6 +333,49 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
         logger.warning(f"on_search hook 异常（已忽略）: {e}")
 
     return merged
+
+
+def _apply_metadata_filter(results: list[dict], category: str = None,
+                          authority: int = None, folder: str = None) -> list[dict]:
+    """P12: 按元数据过滤检索结果（category/authority/folder）。
+    从 chunks JOIN files 取元数据，过滤后保留匹配的 chunks。
+    """
+    if not results:
+        return results
+
+    from src.storage.db import _get_conn
+    conn = _get_conn()
+
+    # 收集所有 file_id
+    file_ids = list({r["file_id"] for r in results if r.get("file_id")})
+    if not file_ids:
+        return results
+
+    # 构建 files 元数据查询
+    conds = ["id IN (" + ",".join("?" * len(file_ids)) + ")"]
+    args = list(file_ids)
+
+    if category:
+        conds.append("category = ?")
+        args.append(category)
+    if authority is not None:
+        conds.append("authority >= ?")
+        args.append(authority)
+    if folder:
+        conds.append("(folder = ? OR folder LIKE ?)")
+        args.append(folder)
+        args.append(folder + "/%")
+
+    rows = conn.execute(
+        f"SELECT id FROM files WHERE {' AND '.join(conds)}",
+        tuple(args)
+    ).fetchall()
+    allowed_ids = {r["id"] for r in rows}
+
+    filtered = [r for r in results if r.get("file_id") in allowed_ids]
+    if len(filtered) < len(results):
+        logger.info(f"P12 元数据过滤: {len(results)} -> {len(filtered)} (category={category}, authority={authority}, folder={folder})")
+    return filtered
 
 
 def _summarize_recall(results: list[dict], source: str, limit: int = 30) -> list[dict]:
@@ -407,7 +526,9 @@ def _filename_recall(query: str, limit: int = 30) -> list[dict]:
     results = []
     seen = set()
     for hits, _, fid in scored:
-        for c in get_chunks_by_file(fid):
+        # 先截断每个文件的 chunk 数，避免大文件（1500+ chunks）一次性全量拉取
+        file_chunks = get_chunks_by_file(fid)[:10]
+        for c in file_chunks:
             cid = c["id"]
             if cid in seen:
                 continue
@@ -761,7 +882,8 @@ def _rrf_fusion(bm25: list[dict], vec: list[dict], top_k: int, k: int = None,
     for rank, item in enumerate(bm25):
         cid = item["id"]
         scores[cid] = scores.get(cid, 0) + BM25_WEIGHT / (k + rank + 1)
-        details[cid] = item
+        if cid not in details:
+            details[cid] = dict(item)  # 复制，避免共享引用污染上游数据
 
     # 向量排名
     for rank, item in enumerate(vec):

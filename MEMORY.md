@@ -1,5 +1,67 @@
 # MEMORY.md — 长期记忆索引
 
+## 🔴 深度审计与优化（2026-09-15，6 模块全量扫描）
+
+用户要求「写入伏羲真实结构日志 + 对所有模块逐层深入检测优化」。6 个子任务并行扫描 retrieval/storage/chat/pipeline/api-llm-mcp/frontend，发现 119 个问题，修复 20 个 Critical + 5 个高 ROI Warning。
+
+**结构日志**：`docs/structure/SYSTEM.md`（目录树 + 数据流 + 表结构 + Feature Flags + LLM 降级链 + 审计报告）。
+
+**关键修复摘要**：
+- retrieval: HyDE KeyError、_rrf_fusion 共享引用污染、元数据过滤顺序错误、chunk 截断、k 硬编码、自环防护
+- storage: 孤儿实体清理、upsert_entity ON CONFLICT 竞态、audit_log 建表、delete_conversation 事务、ensure_synced 分批
+- chat: 流式异常信号、缓存脏写、web sources 缺失
+- pipeline: 临时目录泄露、numpy 延迟 import 静默失败
+- api: Wiki 鉴权缺失、流式熔断器绕过、MCP 重复初始化
+- frontend: WikiView fetch→axios、ChatView SSE AbortController、DocumentsView 初始加载
+
+**剩余高优 Warning 20 项**（详见 SYSTEM.md 第七节），主要集中在：并发竞态（permissions/version）、资源泄漏（连接池/内存）、性能浪费（N+1 查询/max_tokens 过大）、安全（端点鉴权遗漏）。
+
+**2026-09-15 11:22 第二轮修复**：20 个 Warning 全部修复。剩余 Suggestion 级别 55 项（代码质量改进建议，非阻塞）。
+
+**2026-09-15 11:31 第三轮修复**：32 个 Suggestion 全部修复。审计 119 项中已修复 72 项（60.5%）。
+
+**2026-09-15 11:59 第四轮修复**：后端 S33-S42（10 项 docstring/代码质量）+ 前端 S43-S59（17 项去重/错误处理/无障碍/注释）= 27 项。审计 119 项中已修复 99 项（83.2%）。
+
+**2026-09-15 12:18 前端设计精修**：6 维度审查发现 20 个设计问题，全部 30 项修复完成（D1-D30）：
+- D1-D8：CSS 变量统一（硬编码色→var、语义色别名、字体 scale、对比度修复、Element Plus 主色覆盖）
+- D9-D18：可访问性（侧边栏/对话列表/chips 键盘导航、消息 ARIA role=log、Canvas aria-label、页面切换过渡动画、代码块溢出、弹窗响应式、空状态操作按钮）
+- D19-D30：交互细节（思考中打字机动画、骨架屏组件 SkeletonBlock.vue、错误码映射 errors.js、确认弹窗封装 confirm.js、新建文件夹验证、侧边栏 padding、表格行高、图标语义、登录表单验证、标签折叠）
+- 新增文件：`components/SkeletonBlock.vue`、`utils/errors.js`、`utils/confirm.js`
+- 报告：`frontend/设计精审报告.md`
+
+**伏羲现状基线**：后端 src 约 13,707 行，前端 7,801 行，FastAPI+Vue3+SQLite+ChromaDB+本地BGE+自建混合检索+SeedDMS 对接。
+
+## 🔴 企业化进阶批量落地（2026-09-10，Phase 0 全部 + Phase 1 大部分）
+
+用户要求按 `docs/企业化进阶/` 六份文档的诊断清单逐项执行，并同步更新文档。
+
+### Phase 0 全部完成（5/5）
+- **P3 清洗质量分**：`src/pipeline/quality.py`（4维评分：token率/乱码率/结构/长度）+ `files.quality_score` 字段 + 前端列表展示质量标签。
+- **P15 检索评测基线**：`scripts/retrieval_benchmark.py` 升级为 32 条 golden set + Recall@K/MRR/nDCG + 离线/在线双模式 + 工业/语义分类统计。基线：工业精确类 Recall@5=76%, MRR=0.71。
+- **P20 任务队列持久化+重试**：`tasks` 表新增 6 列（retry_count/max_retries/next_retry_at/dead_letter/checkpoint_stage/checkpoint_data）+ `engine.py` 指数退避重试（5s→10s→20s）+ 断点续跑 + 死信队列 + 重试调度线程。`recover_tasks()` 从「全标 failed」改为「有 checkpoint 续跑，无 checkpoint 重跑」。
+- **P21 备份+恢复**：`scripts/backup.py`（VACUUM INTO 一致性快照 + Chroma/uploads/images 打包 + 校验）+ `scripts/restore.py`（回滚点 + 完整性校验 + 覆盖恢复）。首次备份 108.8MB 校验通过。
+- **P25 健康指标端点**：`src/metrics.py`（滑动窗口计数器 + 延迟直方图）+ `GET /api/metrics` 端点（HTTP/QPS/LLM/任务/缓存 5 维指标）+ 请求中间件自动记录。
+
+### Phase 1 大部分完成（4/6）
+- **P1 PDF 结构化解析**：`parser.py::_page_text_reflowed` 改用 fitz dict API 提取字体信息，自动识别标题层级（`# 大标题` / `## 小标题` / `### 加粗短文本`）。
+- **P2 OCR 后处理**：`parser.py::_postprocess_ocr` 新函数：页眉页脚检测（连续≥3页相同首行/末行）+ 页号过滤 + 段落合并 + 重复行去重。
+- **P7 parent-child 切块**：`chunker.py` 每个 chunk 新增 `section_id` + `section_text` 字段 + `engine.py::_build_reference_context` 命中子块时优先喂父段上下文（section_text > 1.5x content 时替代）。
+- **Wiki M1+M2 地基+链路**：`wiki_pages/wiki_links/wiki_versions` 3 张表 + `src/storage/wiki.py` CRUD + `src/api/wiki.py` 8 端点 + `src/pipeline/wiki_compiler.py` LLM 编译 Stage + `frontend/src/views/WikiView.vue` 列表/详情/编辑/双链/版本历史 + 路由 `/wiki` + 侧边栏入口。
+
+### Phase 1 剩余（2/6）
+- P4 清洗样本库回归：`data/eval/cleaning_samples/` + 回归脚本（待做）
+- P26 CI 门禁：GitHub Actions / 内网 runner（待做）
+
+### 关键事实
+- `files` 表新增 `quality_score` 列（INTEGER, default -1, -1=未评分 0-100=质量分）
+- `tasks` 表新增 6 列（retry_count/max_retries/next_retry_at/dead_letter/checkpoint_stage/checkpoint_data）
+- Wiki 3 张表：`wiki_pages`（slug 唯一, source_file_ids/entity_ids JSON, status, compiled_by, version）/ `wiki_links`（双链, link_type=wiki/related/source）/ `wiki_versions`（版本历史, 可回滚）
+- 重试调度器：后台线程每 10s 扫描 retrying 任务，到期重新入队
+- `_postprocess_ocr` 页眉检测阈值：连续≥3页且出现频率≥30%
+- 全部改动 smoke_test 22/0 通过，167 pytest 1 failed（既有的数据依赖测试，非回归）
+
+---
+
 ## 🔴 前端交互借鉴与增强（2026-09-08，三项方案 + 已落地两项阶段一）
 
 用户问「前端设计/面板/框架有没有借鉴成熟项目」，结论：设计语言是自研「工业精工 v3」已成熟；真正值得借鉴的是三个具体交互模式。方案文档 `docs/audit/前端交互借鉴与增强方案.md`。

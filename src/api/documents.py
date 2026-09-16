@@ -1,4 +1,4 @@
-"""api/documents.py — 文档管理路由"""
+﻿"""api/documents.py — 文档管理路由"""
 import logging
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from pydantic import BaseModel, Field
@@ -37,8 +37,10 @@ async def api_upload(
     folder_id 为空时默认写入 SeedDMS 根文件夹（id=1）。
     文件不再落伏羲本地 data/uploads/，原件只存 SeedDMS。
     写入 DMS 后立即返回 dms_doc_id，向量化入后台线程，不阻塞上传请求。
+    P22: 同名/同内容文件去重（sha256 检测）。
     """
     from pathlib import Path as _Path
+    import hashlib
     safe_name = _Path(file.filename or "").name or "upload"
     from config import MAX_UPLOAD_SIZE_MB
     limit_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
@@ -52,6 +54,29 @@ async def api_upload(
     if len(content) == 0:
         raise BizError(ErrorCode.EMPTY_FILE)
     content_bytes = bytes(content)
+
+    # P22: 计算 sha256 并检查去重
+    content_hash = hashlib.sha256(content_bytes).hexdigest()
+    from src.storage.files import get_file_by_hash
+    existing = get_file_by_hash(content_hash)
+    if existing:
+        logger.info(f"P22 去重: 文件 '{safe_name}' 与已有文件 id={existing['id']} '{existing['name']}' 内容相同，跳过")
+        from src.storage.audit import log_action
+        log_action(user_id=user.get("id"), username=user.get("username"),
+                   action="upload_dedup", target_type="file", target_id=existing["id"],
+                   detail=f"filename={safe_name}, existing={existing['name']}")
+        return {
+            "status": "ok",
+            "data": {
+                "dms_doc_id": None,
+                "task_id": None,
+                "filename": safe_name,
+                "existing_file_id": existing['id'],
+                "existing_file_name": existing['name'],
+                "message": f"内容与已有文件 '{existing['name']}'(id={existing['id']}) 完全相同，跳过重复入库",
+                "dedup": True,
+            },
+        }
 
     # 1) 写入 SeedDMS（原件唯一存储）——这一步同步完成，快速返回
     from src.dms.writer import upload_document, SeedDMSWriteError
@@ -69,7 +94,7 @@ async def api_upload(
         raise BizError(ErrorCode.DMS_WRITE_FAILED, f"写入 SeedDMS 失败: {e}")
 
     # 2) 向量化丢后台异步执行（不阻塞上传）
-    task_id = _spawn_vectorize(dms_doc_id, safe_name)
+    task_id = _spawn_vectorize(dms_doc_id, safe_name, content_hash=content_hash)
 
     return {
         "status": "ok",
@@ -78,6 +103,7 @@ async def api_upload(
             "task_id": task_id,
             "filename": safe_name,
             "message": "已存入 SeedDMS，正在后台向量化",
+            "dedup": False,
         },
     }
 
@@ -87,7 +113,7 @@ async def api_upload(
 _vectorize_jobs: dict[int, dict] = {}
 
 
-def _spawn_vectorize(dms_doc_id: int, filename: str) -> str | None:
+def _spawn_vectorize(dms_doc_id: int, filename: str, content_hash: str = None) -> str | None:
     """后台线程：从 SeedDMS 拉取文档并向量化入库（复用 import_service 闭环）。
 
     返回 task_id（入库引擎 task_id，用于轮询实时进度），但 task_id 是在 enqueue
@@ -97,9 +123,20 @@ def _spawn_vectorize(dms_doc_id: int, filename: str) -> str | None:
     import time
     from src.dms import import_service
 
+    # W11: 清理过期条目，防止内存泄漏
+    now = time.time()
+    stale_keys = [k for k, v in _vectorize_jobs.items() if now - v.get("created_at", 0) > 3600]
+    for k in stale_keys:
+        _vectorize_jobs.pop(k, None)
+    if len(_vectorize_jobs) > 500:
+        oldest = sorted(_vectorize_jobs.items(), key=lambda x: x[1].get("created_at", 0))[:len(_vectorize_jobs) - 500]
+        for k, _ in oldest:
+            _vectorize_jobs.pop(k, None)
+
     _vectorize_jobs[dms_doc_id] = {
         "task_id": None,
         "filename": filename,
+        "content_hash": content_hash,
         "created_at": time.time(),
     }
 
@@ -126,6 +163,13 @@ def _spawn_vectorize(dms_doc_id: int, filename: str) -> str | None:
                     from src.dms.sync_state import get_import_record
                     rec = get_import_record(dms_doc_id)
                     job["file_id"] = rec.get("file_id") if rec else None
+                    # P22: 回填 content_hash
+                    if job.get("content_hash") and job.get("file_id"):
+                        try:
+                            from src.storage.files import update_file_hash
+                            update_file_hash(job["file_id"], job["content_hash"])
+                        except Exception as e:
+                            logger.warning(f"P22 回填 content_hash 失败: {e}")
         except Exception as e:
             logger.error(f"后台向量化异常 doc_id={dms_doc_id} ({filename}): {e}")
             job = _vectorize_jobs.get(dms_doc_id)
@@ -191,17 +235,23 @@ def api_vectorize_status(dms_doc_id: int, user=Depends(get_current_user)):
 
 @router.get("/api/documents")
 def api_list_files(category: str = None, model: str = None, material: str = None, date: str = None, folder: str = None, user=Depends(get_current_user)):
+    """获取文档列表（支持分类/型号/材料/日期/文件夹筛选）
+
+    返回文件列表，每个文件附带关联的型号和材料实体。
+    """
     files = list_files_with_entities(category=category, model=model, material=material, date=date, folder=folder)
     return {"status": "ok", "data": files}
 
 
 @router.get("/api/folders")
 def api_list_folders(user=Depends(get_current_user)):
+    """获取文件夹树（含文件计数）"""
     return {"status": "ok", "data": list_folders()}
 
 
 @router.put("/api/documents/{file_id}/folder")
 def api_move_file(file_id: int, req: FolderReq, user=Depends(require_admin)):
+    """移动文件到指定文件夹"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
@@ -209,8 +259,48 @@ def api_move_file(file_id: int, req: FolderReq, user=Depends(require_admin)):
     return {"status": "ok"}
 
 
+# === P23: 回收站（必须在 {file_id} 路由之前，否则被通配符吃掉） ===
+
+@router.get("/api/documents/recycle-bin")
+def api_recycle_bin(user=Depends(require_admin)):
+    """P23: 列出回收站中的文件"""
+    from src.storage.files import list_deleted_files
+    files = list_deleted_files()
+    return {"status": "ok", "data": files}
+
+
+@router.post("/api/documents/{file_id}/restore")
+def api_restore_file(file_id: int, user=Depends(require_admin)):
+    """P23: 从回收站恢复文件"""
+    from src.storage.files import restore_file
+    ok = restore_file(file_id)
+    if not ok:
+        raise BizError(ErrorCode.FILE_NOT_FOUND, detail="文件不在回收站中")
+    from src.storage.audit import log_action
+    log_action(user_id=user.get("id"), username=user.get("username"),
+               action="restore", target_type="file", target_id=file_id)
+    return {"status": "ok"}
+
+
+@router.delete("/api/documents/{file_id}/permanent")
+def api_permanent_delete(file_id: int, user=Depends(require_admin)):
+    """P23: 永久删除（不可恢复）"""
+    from src.storage.files import permanent_delete_file
+    from src.storage.db import _get_conn
+    f = dict(_get_conn().execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone() or {})
+    if not f:
+        raise BizError(ErrorCode.FILE_NOT_FOUND)
+    permanent_delete_file(file_id)
+    from src.storage.audit import log_action
+    log_action(user_id=user.get("id"), username=user.get("username"),
+               action="permanent_delete", target_type="file", target_id=file_id,
+               detail=f"name={f['name']}")
+    return {"status": "ok"}
+
+
 @router.get("/api/documents/{file_id}")
 def api_get_file(file_id: int, user=Depends(get_current_user)):
+    """获取文件详情（含所有 chunk）"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
@@ -220,6 +310,7 @@ def api_get_file(file_id: int, user=Depends(get_current_user)):
 
 @router.get("/api/documents/{file_id}/backlinks")
 def api_file_backlinks(file_id: int, user=Depends(get_current_user)):
+    """获取文件的双向链接（Obsidian 式 backlinks）"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
@@ -263,6 +354,50 @@ def api_file_markdown(file_id: int, user=Depends(get_current_user)):
     return {"status": "ok", "data": {"markdown": md, "file_name": f["name"]}}
 
 
+def _serve_file(file_id: int, disposition: str):
+    """内部：返回文件流。disposition='inline'=预览，'attachment'=下载。"""
+    from fastapi.responses import FileResponse
+    import os
+    f = get_file(file_id)
+    if not f:
+        raise BizError(ErrorCode.FILE_NOT_FOUND)
+    fpath = f.get("path", "")
+    if not fpath or not os.path.isfile(fpath):
+        raise BizError(ErrorCode.FILE_NOT_FOUND, "原始文件不存在（可能已被清理）")
+    ext = (f.get("ext") or "").lower()
+    mime_map = {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".ppt": "application/vnd.ms-powerpoint",
+        ".pdf": "application/pdf",
+    }
+    media_type = mime_map.get(ext, "application/octet-stream")
+    from urllib.parse import quote
+    # RFC 5987: 文件名中文编码
+    ascii_name = f["name"].encode('ascii', 'ignore').decode() or 'file'
+    utf8_name = quote(f["name"])
+    cd = f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
+    return FileResponse(
+        fpath, media_type=media_type,
+        headers={"Content-Disposition": cd},
+    )
+
+
+@router.get("/api/documents/{file_id}/raw")
+def api_file_raw(file_id: int, user=Depends(get_current_user)):
+    """预览：inline 返回，浏览器内展示不触发下载。"""
+    return _serve_file(file_id, "inline")
+
+
+@router.get("/api/documents/{file_id}/download")
+def api_file_download(file_id: int, user=Depends(require_admin)):
+    """下载：仅管理员可用，attachment 触发浏览器下载。"""
+    return _serve_file(file_id, "attachment")
+
+
 @router.get("/api/documents/{file_id}/images")
 def api_file_images(file_id: int, user=Depends(get_current_user)):
     f = get_file(file_id)
@@ -274,10 +409,49 @@ def api_file_images(file_id: int, user=Depends(get_current_user)):
 
 @router.delete("/api/documents/{file_id}")
 def api_delete_file(file_id: int, user=Depends(require_admin)):
+    """删除文件（软删除，移入回收站）"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
     delete_file(file_id)
+    from src.storage.audit import log_action
+    log_action(user_id=user.get("id"), username=user.get("username"),
+               action="delete", target_type="file", target_id=file_id,
+               detail=f"name={f['name']}")
+    return {"status": "ok"}
+
+
+@router.get("/api/audit")
+def api_audit_logs(limit: int = 100, action: str = None, user=Depends(require_admin)):
+    """查询审计日志"""
+    # S9: limit 参数上限约束
+    limit = min(limit, 1000)
+    from src.storage.audit import get_audit_logs
+    logs = get_audit_logs(limit=limit, action=action)
+    return {"status": "ok", "data": logs}
+
+
+@router.get("/api/documents/{file_id}/permissions")
+def api_get_permissions(file_id: int, user=Depends(require_admin)):
+    """获取文件权限"""
+    from src.storage.permissions import get_file_permissions
+    perms = get_file_permissions(file_id)
+    return {"status": "ok", "data": perms}
+
+
+@router.post("/api/documents/{file_id}/permissions")
+def api_set_permission(file_id: int, user_id: int = None, role: str = None,
+                      permission: str = "read", user=Depends(require_admin)):
+    """设置文件权限"""
+    # S17: 参数枚举校验
+    _VALID_ROLES = {"admin", "user", "viewer", None}
+    _VALID_PERMISSIONS = {"read", "write", "admin"}
+    if role not in _VALID_ROLES:
+        raise HTTPException(400, f"role 必须是 admin/user/viewer 或留空，收到: {role}")
+    if permission not in _VALID_PERMISSIONS:
+        raise HTTPException(400, f"permission 必须是 read/write/admin，收到: {permission}")
+    from src.storage.permissions import set_file_permission
+    set_file_permission(file_id, user_id=user_id, role=role, permission=permission)
     return {"status": "ok"}
 
 
@@ -293,6 +467,7 @@ def api_cancel_task(task_id: str, user=Depends(require_admin)):
 
 @router.put("/api/documents/{file_id}/category")
 def api_set_category(file_id: int, req: CategoryReq, user=Depends(require_admin)):
+    """设置文件分类"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
@@ -302,6 +477,7 @@ def api_set_category(file_id: int, req: CategoryReq, user=Depends(require_admin)
 
 @router.put("/api/documents/{file_id}/tags")
 def api_set_tags(file_id: int, req: TagsReq, user=Depends(require_admin)):
+    """设置文件标签"""
     f = get_file(file_id)
     if not f:
         raise BizError(ErrorCode.FILE_NOT_FOUND)
@@ -343,46 +519,18 @@ def api_health():
         checks["chroma"] = f"error: {e}"
 
     # 3. LLM key 配置（软检查，不调用）
-    from src.llm import _has_any_key
+    from src.llm_client import _has_any_key
     checks["llm_configured"] = _has_any_key()
-
-    # 4. 磁盘剩余（工作目录所在盘）
-    try:
-        usage = __import__("shutil").disk_usage(os.getcwd())
-        checks["disk_free_gb"] = round(usage.free / 1024 / 1024 / 1024, 2)
-    except Exception as e:
-        checks["disk_free_gb"] = f"error: {e}"
-
-    # 5. LLM 调用审计（降级率体温计，可观测性）
-    try:
-        from src.llm_audit import get_stats, degradation_rate
-        checks["llm_degradation_rate"] = degradation_rate()
-        stats = get_stats()
-        checks["llm_calls"] = stats["calls"]
-        checks["llm_total_tokens"] = {"in": stats["total_tokens_in"], "out": stats["total_tokens_out"]}
-    except Exception as e:
-        checks["llm_audit"] = f"error: {e}"
-
-    # 6. 最近一次检索耗时 profile（可观测性）
-    try:
-        from src.retrieval.search import get_last_profile
-        p = get_last_profile()
-        if p:
-            checks["last_search_profile_ms"] = p
-    except Exception:
-        pass
-
-    # 7. 最近一次对话链路耗时 profile（可观测性，与检索 profile 对齐）
-    try:
-        from src.chat.orchestrator import get_last_chat_profile
-        cp = get_last_chat_profile()
-        if cp:
-            checks["last_chat_profile_ms"] = cp
-    except Exception:
-        pass
 
     return {
         "status": "ok" if healthy else "degraded",
         "service": "rag-framework",
         "checks": checks,
     }
+
+
+@router.get("/api/metrics")
+def api_metrics(user=Depends(require_admin)):
+    """P25: 持续指标端点（JSON 格式，供巡检器/脚本消费）"""
+    from src.metrics import get_metrics
+    return get_metrics()

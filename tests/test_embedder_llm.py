@@ -1,4 +1,4 @@
-"""P0 核心链路测试：embedder.py 纯函数 + llm.py 工具函数
+﻿"""P0 核心链路测试：embedder.py 纯函数 + llm.py 工具函数
 
 纯函数（无网络/无模型加载）：_pack/_unpack、cosine_similarity、SQ8 量化、extract_json、provider chain。
 """
@@ -9,7 +9,7 @@ from src.pipeline.embedder import (
     _pack, _unpack, cosine_similarity,
     quantize_sq8, dequantize_sq8, cosine_similarity_sq8,
 )
-from src.llm import extract_json, _build_provider_chain
+from src.llm_client import extract_json, _build_provider_chain
 
 
 class TestPackUnpack:

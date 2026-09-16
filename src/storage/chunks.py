@@ -6,6 +6,13 @@ from src.storage.connection import _get_conn, _dumps
 logger = logging.getLogger('rag.db.chunks')
 
 
+def _sanitize_fts_content(text: str) -> str:
+    """C5: 清理 FTS5 特殊字符，防止 trigram 索引脏数据。"""
+    import re
+    # 移除 FTS5 控制字符，保留中文/英文/数字/标点
+    return re.sub(r'[\x00-\x1f*^:"{}\[\]()]', ' ', text)
+
+
 # === Chunk 操作 ===
 
 def add_chunks_batch(rows: list[tuple]) -> list[int]:
@@ -32,10 +39,10 @@ def add_chunks_batch(rows: list[tuple]) -> list[int]:
                 "INSERT OR REPLACE INTO chunks_fts(rowid, content) VALUES (?, ?)",
                 (rowid, segment_for_fts(row[2]))
             )
-            # trigram 索引：中文子串匹配
+            # trigram 索引：中文子串匹配（C5: 预处理特殊字符）
             conn.execute(
                 "INSERT OR REPLACE INTO chunks_fts_tri(rowid, content) VALUES (?, ?)",
-                (rowid, row[2])
+                (rowid, _sanitize_fts_content(row[2]))
             )
             chunk_ids.append(rowid)
     return chunk_ids
@@ -68,17 +75,23 @@ def fts_search(query: str, limit: int = 20) -> list[dict]:
     """FTS5 BM25 全文搜索（双索引：jieba 分词 + trigram 子串），返回 chunk + 文件名"""
     conn = _get_conn()
     fts_query = _to_fts_query(query)
+    logger.warning(f"[FTS_DEBUG] query={query!r} fts_query={fts_query!r} conn={id(conn)}")
 
     # 主索引：jieba 分词 + unicode61（词级匹配）
     # MATCH 用 ? 参数绑定（FTS5 官方推荐），根除 f-string 拼接的注入/语法错误面。
-    rows = conn.execute(
-        "SELECT c.id, c.content, c.file_id, c.chunk_index, f.name as file_name, "
-        "fts.rank as score FROM chunks_fts fts "
-        "JOIN chunks c ON c.id = fts.rowid "
-        "JOIN files f ON f.id = c.file_id "
-        "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-        (fts_query, limit)
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT c.id, c.content, c.file_id, c.chunk_index, f.name as file_name, "
+            "fts.rank as score FROM chunks_fts fts "
+            "JOIN chunks c ON c.id = fts.rowid "
+            "JOIN files f ON f.id = c.file_id "
+            "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+            (fts_query, limit)
+        ).fetchall()
+        logger.warning(f"[FTS_DEBUG] main index rows={len(rows)} for query={query!r}")
+    except Exception as e:
+        logger.error(f"[FTS_DEBUG] main index error: {e}")
+        rows = []
     results = {r["id"]: dict(r) for r in rows}
 
     # 补充索引：trigram（CJK 子串匹配，捕获分词遗漏的短语）
@@ -133,13 +146,13 @@ def get_graph_data() -> dict:
     conn = _get_conn()
     nodes = conn.execute(
         "SELECT id, name, category, chunk_count, "
-        "CAST(id AS TEXT) as group_id FROM files"
+        "CAST(id AS TEXT) as group_id FROM files WHERE deleted_at IS NULL"
     ).fetchall()
     edges = conn.execute(
         "SELECT l.source_id, l.target_id, l.link_type, l.weight, l.context "
         "FROM links l "
-        "JOIN files fs ON fs.id = l.source_id "
-        "JOIN files ft ON ft.id = l.target_id"
+        "JOIN files fs ON fs.id = l.source_id AND fs.deleted_at IS NULL "
+        "JOIN files ft ON ft.id = l.target_id AND ft.deleted_at IS NULL"
     ).fetchall()
     return {
         "nodes": [dict(n) for n in nodes],

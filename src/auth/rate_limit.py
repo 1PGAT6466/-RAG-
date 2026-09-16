@@ -6,7 +6,7 @@
 """
 import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 
 
 class RateLimiter:
@@ -16,7 +16,7 @@ class RateLimiter:
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._hits: dict[str, deque] = {}
-        self._access_order: list[str] = []  # LRU 淘汰用
+        self._access_order: OrderedDict[str, None] = OrderedDict()  # C4: OrderedDict O(1)
         self._lock = threading.Lock()
 
     def allow(self, key: str) -> bool:
@@ -53,20 +53,19 @@ class RateLimiter:
                 empty_keys.append(key)
         for key in empty_keys:
             del self._hits[key]
-            if key in self._access_order:
-                self._access_order.remove(key)
+            self._access_order.pop(key, None)  # C4: O(1)
 
     def _evict_lru(self):
         """淘汰最久未访问的 key"""
         while self._access_order and len(self._hits) >= self._MAX_KEYS:
-            oldest = self._access_order.pop(0)
-            self._hits.pop(oldest, None)
+            oldest = next(iter(self._access_order))
+            del self._hits[oldest]
+            del self._access_order[oldest]
 
     def _touch(self, key: str):
         """更新 LRU 访问顺序"""
-        if key in self._access_order:
-            self._access_order.remove(key)
-        self._access_order.append(key)
+        self._access_order.pop(key, None)
+        self._access_order[key] = None  # OrderedDict 末尾 = 最近访问
 
 
 # 登录/注册各用一个限流器（独立计数，避免相互干扰）

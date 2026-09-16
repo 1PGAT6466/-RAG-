@@ -41,4 +41,15 @@ from src.storage.conversations import (
 # 入库任务持久化
 from src.storage.tasks import (
     save_task, load_tasks, mark_stale_tasks_failed, delete_task,
+    load_retryable_tasks, load_resumable_tasks, mark_task_retrying,
+    mark_task_dead, save_checkpoint, get_dead_letter_tasks, retry_dead_letter,
+    cancel_task, cleanup_stale_tasks,
+)
+from src.storage.wiki import (
+    create_page as create_wiki_page, get_page as get_wiki_page,
+    get_page_by_slug as get_wiki_page_by_slug, list_pages as list_wiki_pages,
+    update_page as update_wiki_page, delete_page as delete_wiki_page,
+    add_link as add_wiki_link, get_links as get_wiki_links,
+    get_backlinks as get_wiki_backlinks, get_versions as get_wiki_versions,
+    get_stale_pages as get_wiki_stale_pages,
 )

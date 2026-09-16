@@ -1,4 +1,4 @@
-"""
+﻿"""
 entity_extractor.py — 实体抽取（阶段 2）
 
 两种抽取方式，可降级：
@@ -208,7 +208,14 @@ def _match_word(pattern: str, text: str) -> bool:
 
 
 def extract_rule(text: str) -> list[dict]:
-    """规则抽取：返回结构化实体列表（无需 LLM）"""
+    """规则抽取：返回结构化实体列表（无需 LLM）
+
+    Args:
+        text: 待抽取的文本内容
+
+    Returns:
+        实体列表 [{name, type, aliases, description, attributes}, ...]
+    """
     if not text:
         return []
     entities = []
@@ -392,6 +399,7 @@ def normalize_entities(entities: list[dict]) -> list[dict]:
     """实体规范化：
     1. 过滤泛化词（"连接器"、"设计流程"等不具区分度的通用词）
     2. 系列归并：MLG12-45 → MLG12（规格 45 记入 attributes.variants）
+    3. 别名自动补全（同义归并）：按别名字典，补全 aliases
     """
     out = []
     series_map: dict[str, dict] = {}  # 系列名 -> {entity, variants:set}
@@ -469,7 +477,7 @@ _LLM_SYSTEM_PROMPT = """你是工业知识库的实体抽取引擎。从给定�
 
 def _llm_call_sync(text: str) -> str:
     """同步调用 LLM（MiMo 优先），委托 src.llm。"""
-    from src.llm import call_llm_sync
+    from src.llm_client import call_llm_sync
     messages = [
         {"role": "system", "content": _LLM_SYSTEM_PROMPT},
         {"role": "user", "content": text},
@@ -478,7 +486,14 @@ def _llm_call_sync(text: str) -> str:
 
 
 def extract_llm_sync(text: str) -> list[dict]:
-    """同步版 LLM 抽取（供后台线程池 worker 使用，避免线程内 asyncio.run 的资源冲突）"""
+    """同步版 LLM 抽取（供后台线程池 worker 使用，避免线程内 asyncio.run 的资源冲突）
+
+    Args:
+        text: 待抽取的文本内容
+
+    Returns:
+        实体列表 [{name, type, aliases, description, attributes}, ...]
+    """
     content = _llm_call_sync(text)
     entities = _parse_json_array(content)
     return _dedup(normalize_entities(entities))
@@ -486,7 +501,7 @@ def extract_llm_sync(text: str) -> list[dict]:
 
 def _parse_json_array(content: str) -> list[dict]:
     """从 LLM 输出中稳健地提取 JSON 数组，委托 src.llm.extract_json。"""
-    from src.llm import extract_json
+    from src.llm_client import extract_json
     if not content:
         return []
     # 先尝试直接解析整个内容（可能含 entities 包装）
@@ -505,7 +520,14 @@ def _parse_json_array(content: str) -> list[dict]:
 
 
 def classify_standard(name: str) -> str | None:
-    """标准号领域分类：根据前缀规则返回领域类别，未命中返回 None（调用方归「其他」）"""
+    """标准号领域分类：根据前缀规则返回领域类别，未命中返回 None（调用方归「其他」）
+
+    Args:
+        name: 标准号（如 "GB/T 3077"）
+
+    Returns:
+        领域类别（如 "材料"、"紧固件"）或 None
+    """
     if not name:
         return None
     name = name.strip()
@@ -526,7 +548,14 @@ _LOW_CONFIDENCE_RANGES = [
 
 
 def is_low_confidence_standard(name: str) -> bool:
-    """判断标准号是否为规则分类低置信（落在宽泛混淆号段）"""
+    """判断标准号是否为规则分类低置信（落在宽泛混淆号段）
+
+    Args:
+        name: 标准号（如 "GB/T 3077"）
+
+    Returns:
+        True 表示低置信（需 LLM 精分类），False 表示规则分类可靠
+    """
     m = re.match(r'^GB/T\s*(\d+)', name.strip())
     if not m:
         return False
@@ -537,8 +566,12 @@ def is_low_confidence_standard(name: str) -> bool:
 def llm_classify_standards(names: list[str]) -> dict[str, str]:
     """LLM 批量精分类：分批调用把标准号分到领域
 
-    返回 {标准号: 领域}。对规则低置信度的号段，用 LLM 按标准名称判定真实领域。
-    失败返回空 dict（调用方保留规则分类结果）。
+    Args:
+        names: 标准号列表（如 ["GB/T 3077", "GB/T 5780"]）
+
+    Returns:
+        {标准号: 领域}。对规则低置信度的号段，用 LLM 按标准名称判定真实领域。
+        失败返回空 dict（调用方保留规则分类结果）。
     """
     if not names:
         return {}
@@ -552,7 +585,7 @@ def llm_classify_standards(names: list[str]) -> dict[str, str]:
 
 def _call_llm_classify_batch(names: list[str]) -> dict[str, str]:
     """单批 LLM 标准分类（≤20 个），委托 src.llm。"""
-    from src.llm import call_llm_sync, extract_json
+    from src.llm_client import call_llm_sync, extract_json
 
     domains = "、".join(STANDARD_DOMAINS)
     user = (

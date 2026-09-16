@@ -9,34 +9,56 @@ logger = logging.getLogger("rag.db.files")
 
 # === 文件操作 ===
 
-def add_file(name: str, path: str, ext: str = "", size: int = 0, folder: str = "/") -> int:
+def add_file(name: str, path: str, ext: str = "", size: int = 0, folder: str = "/", content_hash: str = None) -> int:
     conn = _get_conn()
     cur = conn.execute(
-        "INSERT INTO files (name, path, ext, size, folder) VALUES (?,?,?,?,?)",
-        (name, path, ext, size, normalize_folder(folder))
+        "INSERT INTO files (name, path, ext, size, folder, content_hash) VALUES (?,?,?,?,?,?)",
+        (name, path, ext, size, normalize_folder(folder), content_hash)
     )
     conn.commit()
     return cur.lastrowid
 
 
+def get_file_by_hash(content_hash: str) -> dict | None:
+    """按内容哈希查找未删除的文件（P22 去重）"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM files WHERE content_hash=? AND deleted_at IS NULL", (content_hash,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_file_hash(file_id: int, content_hash: str):
+    """更新文件的 content_hash（P22，入库后回填）"""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE files SET content_hash = ? WHERE id = ?",
+        (content_hash, file_id)
+    )
+    conn.commit()
+
+
 def get_file(file_id: int) -> dict | None:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    row = conn.execute("SELECT * FROM files WHERE id=? AND deleted_at IS NULL", (file_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_files(category: str = None, date: str = None, folder: str = None) -> list[dict]:
     conn = _get_conn()
     # 日期筛选（近 N 天），date 形如 "7d"/"30d"/"90d"
-    conds = []
+    conds = ["deleted_at IS NULL"]
     args = []
     if date:
         try:
             days = int(str(date).rstrip("d"))
-            conds.append("updated_at >= datetime('now','localtime', ?)")
-            args.append(f"-{days} days")
+            if days < 1 or days > 365:
+                logger.warning(f"list_files: date 参数超出范围: {date}")
+            else:
+                conds.append("updated_at >= datetime('now','localtime', ?)")
+                args.append(f"-{days} days")
         except ValueError:
-            pass
+            logger.warning(f"list_files: 非法 date 参数: {date}")
     if category:
         conds.append("category = ?")
         args.append(category)
@@ -161,9 +183,13 @@ def normalize_folder(folder: str) -> str:
 def list_folders() -> list[dict]:
     """构建目录树：返回 [{ name, path, count, children: [...] }]，含文件计数"""
     conn = _get_conn()
-    rows = conn.execute("SELECT folder FROM files").fetchall()
+    rows = conn.execute(
+        "SELECT folder, COUNT(*) as cnt FROM files WHERE deleted_at IS NULL GROUP BY folder"
+    ).fetchall()
     tree = {"children": {}, "count": 0}
-    for (folder,) in rows:
+    for row in rows:
+        folder = row[0] if isinstance(row, tuple) else row["folder"]
+        cnt = row[1] if isinstance(row, tuple) else row["cnt"]
         folder = normalize_folder(folder)
         parts = [p for p in folder.split("/") if p]
         node = tree
@@ -172,7 +198,7 @@ def list_folders() -> list[dict]:
             if p not in node["children"]:
                 node["children"][p] = {"children": {}, "count": 0, "path": full}
             node = node["children"][p]
-        node["count"] += 1
+        node["count"] += cnt
 
     def _build(node):
         return [
@@ -189,31 +215,57 @@ def list_folders() -> list[dict]:
 
 
 def delete_file(file_id: int):
+    """软删除：设置 deleted_at，数据保留可恢复（P23）"""
     conn = _get_conn()
-    # 先收集需要清理的数据（在删除之前）
-    chunk_ids = conn.execute("SELECT id FROM chunks WHERE file_id=?", (file_id,)).fetchall()
-    img_paths = conn.execute("SELECT path FROM images WHERE file_id=?", (file_id,)).fetchall()
+    conn.execute(
+        "UPDATE files SET deleted_at = datetime('now','localtime') WHERE id = ?",
+        (file_id,)
+    )
+    conn.commit()
 
-    # 1) 先删 ChromaDB 向量（原子性：Chroma 删失败则中止，避免孤儿向量）
+
+def restore_file(file_id: int) -> bool:
+    """从回收站恢复文件（P23）"""
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE files SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL",
+        (file_id,)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def permanent_delete_file(file_id: int):
+    """永久删除：清除所有数据（Chroma + SQLite + 磁盘）（P23）"""
+    conn = _get_conn()
+    chunk_ids = conn.execute("SELECT id FROM chunks WHERE file_id=?", (file_id,)).fetchall()
+
+    # 1) 删 ChromaDB 向量
     from src.storage.chroma_store import delete_where, _use_chroma
-    chroma_ok = False
     try:
         if _use_chroma():
             delete_where(ids=[str(cid) for (cid,) in chunk_ids])
-        chroma_ok = True
     except Exception as e:
-        logger.error(f"ChromaDB 删除失败（中止删除，避免孤儿向量）: {e}")
+        logger.error(f"ChromaDB 删除失败: {e}")
         raise
 
-    # 2) Chroma 删成功，再删 SQLite（FTS + chunks + files CASCADE）
-    for (cid,) in chunk_ids:
-        conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (cid,))
-        conn.execute("DELETE FROM chunks_fts_tri WHERE rowid=?", (cid,))
-    conn.execute("DELETE FROM links WHERE source_id=? OR target_id=?", (file_id, file_id))
-    conn.execute("DELETE FROM files WHERE id=?", (file_id,))
-    conn.commit()
+    # 2) 删 SQLite（W2: 事务包裹，防止中途异常导致脏数据）
+    cid_list = [cid for (cid,) in chunk_ids]
+    with conn:
+        # 清理实体关联（先于 chunks 删除，避免外键冲突）
+        if cid_list:
+            ph = ",".join("?" * len(cid_list))
+            conn.execute(f"DELETE FROM entity_chunks WHERE chunk_id IN ({ph})", cid_list)
+        conn.execute("DELETE FROM entity_files WHERE file_id=?", (file_id,))
+        # 清理 links
+        conn.execute("DELETE FROM links WHERE source_id=? OR target_id=?", (file_id, file_id))
+        # 清理 chunks + FTS
+        for cid in cid_list:
+            conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (cid,))
+            conn.execute("DELETE FROM chunks_fts_tri WHERE rowid=?", (cid,))
+        conn.execute("DELETE FROM files WHERE id=?", (file_id,))
 
-    # 3) 删磁盘图片目录
+    # 3) 删磁盘图片
     try:
         import shutil
         from config import IMAGES_DIR
@@ -221,7 +273,28 @@ def delete_file(file_id: int):
         if img_dir.exists():
             shutil.rmtree(str(img_dir), ignore_errors=True)
     except Exception as e:
-        logger.warning(f"清理图片目录失败（已忽略）: {e}")
+        logger.warning(f"清理图片目录失败: {e}")
+
+
+def list_deleted_files() -> list[dict]:
+    """列出回收站中的文件（P23）"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM files WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_deleted(days: int = 30):
+    """清理超过 N 天的已删除文件（P23 自动清）"""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT id FROM files WHERE deleted_at < datetime('now','localtime', ?)",
+        (f"-{days} days",)
+    ).fetchall()
+    for (file_id,) in rows:
+        permanent_delete_file(file_id)
+    return len(rows)
 
 
 def sync_chunk_count(file_id: int):
@@ -256,16 +329,18 @@ def get_file_authority(file_id: int) -> int:
 def add_images(file_id: int, images: list[dict]) -> int:
     """批量插入图片记录，返回插入数量"""
     conn = _get_conn()
-    n = 0
-    for img in images:
-        conn.execute(
+    rows = [
+        (file_id, img.get("page", 0), img.get("path", ""),
+         img.get("filename", ""), img.get("width", 0), img.get("height", 0))
+        for img in images
+    ]
+    if rows:
+        conn.executemany(
             "INSERT INTO images (file_id, page, path, filename, width, height) VALUES (?,?,?,?,?,?)",
-            (file_id, img.get("page", 0), img.get("path", ""),
-             img.get("filename", ""), img.get("width", 0), img.get("height", 0))
+            rows,
         )
-        n += 1
     conn.commit()
-    return n
+    return len(rows)
 
 
 def list_images(file_id: int) -> list[dict]:

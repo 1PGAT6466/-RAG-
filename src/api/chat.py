@@ -37,9 +37,8 @@ def _persist_stream(req: "ChatReq", answer: str, sources: list, mode: str):
     try:
         from src.storage.db import _new_conn, add_conversation_message, update_conversation_title, get_conversation_messages
         from src.storage import db as _db
-        # 流结束后请求连接已关闭，临时注入新连接
+        # C3: 简化连接管理——直接新建、用、关，不保存旧连接
         conn = _new_conn()
-        old_conn = _db._conn_var.get()
         _db.set_conn(conn)
         try:
             add_conversation_message(req.conversation_id, "user", req.query, mode=mode, sources=[])
@@ -49,10 +48,40 @@ def _persist_stream(req: "ChatReq", answer: str, sources: list, mode: str):
                 title = req.query[:30] + ("..." if len(req.query) > 30 else "")
                 update_conversation_title(req.conversation_id, title)
         finally:
-            _db.set_conn(old_conn)
             conn.close()
+            _db.reset_conn()
     except Exception as e:
         logger.warning(f"流式对话落库失败（已忽略）: {e}")
+
+
+async def _get_empty_result_suggestions(query: str) -> list[str]:
+    """P19: 空结果引导——从已有文档中提取相近问题建议。
+
+    当检索无结果时，从已有文档的分类和最近上传文件名中生成引导性问题，
+    帮助用户发现可能相关的内容。
+    """
+    try:
+        from src.storage.db import _get_conn
+        conn = _get_conn()
+        # 从已有文档的分类和标签中生成建议
+        cats = conn.execute(
+            "SELECT DISTINCT category FROM files WHERE deleted_at IS NULL AND category != '未分类' LIMIT 5"
+        ).fetchall()
+        suggestions = []
+        for (cat,) in cats:
+            if cat and len(cat) > 1:
+                suggestions.append(f"{cat} 相关的文档有哪些？")
+        # 从最近上传的文件名中提取关键词
+        recent = conn.execute(
+            "SELECT name FROM files WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 3"
+        ).fetchall()
+        for (name,) in recent:
+            clean = name.rsplit('.', 1)[0] if '.' in name else name
+            if len(clean) > 2:
+                suggestions.append(f"介绍一下 {clean}")
+        return suggestions[:5]
+    except Exception:
+        return []
 
 
 class ChatReq(BaseModel):
@@ -61,6 +90,8 @@ class ChatReq(BaseModel):
     mode: str = Field("auto", pattern=r'^(auto|knowledge|chat|web)$')
     history: list[dict] = Field(default_factory=list, max_length=200)
     conversation_id: int | None = None
+    category: str | None = None
+    folder: str | None = None
 
     @field_validator('history', mode='before')
     @classmethod
@@ -164,7 +195,10 @@ async def api_chat_stream(req: ChatReq, user=Depends(get_current_user)):
         from src.chat.engine import generate_web
         async def web_stream():
             answer, web_sources = await generate_web(req.query, web_results)
+            for token in (answer or "").split():
+                pass  # answer already complete, yield below
             yield f"data: {answer}\n\n"
+            yield "__SOURCES__" + _json.dumps(web_sources or [], ensure_ascii=True, separators=(",", ":"))
             yield "data: [DONE]\n\n"
             _persist_stream(req, answer, web_sources or [], "web")
         return StreamingResponse(web_stream(), media_type="text/event-stream")
@@ -177,12 +211,20 @@ async def api_chat_stream(req: ChatReq, user=Depends(get_current_user)):
         search_query = req.query
     else:
         search_query = await rewrite_query(req.query)
-    results = await search(search_query, top_k=req.top_k)
+    results = await search(search_query, top_k=req.top_k, category=req.category, folder=req.folder)
     if not results and search_query != req.query:
-        results = await search(req.query, top_k=req.top_k)
+        results = await search(req.query, top_k=req.top_k, category=req.category, folder=req.folder)
     if not results:
+        # P19: 空结果引导（相近问题推荐 + 上传建议）
+        suggestions = await _get_empty_result_suggestions(req.query)
         async def empty():
             yield "data: 知识库中未检索到相关内容\n\n"
+            if suggestions:
+                yield f"data: **您可能想问：**\n\n"
+                for s in suggestions:
+                    yield f"data: - {s}\n"
+                yield "data: \n"
+            yield "data: 如果知识库中缺少相关文档，请联系管理员上传。\n\n"
             yield "data: [DONE]\n\n"
             _persist_stream(req, "知识库中未检索到相关内容", [], "knowledge")
         return StreamingResponse(empty(), media_type="text/event-stream")

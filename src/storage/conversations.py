@@ -84,9 +84,11 @@ def update_conversation_title(conversation_id: int, title: str):
 
 def delete_conversation(conversation_id: int):
     conn = _get_conn()
-    conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
-    conn.execute("DELETE FROM conversation_messages WHERE conversation_id=?", (conversation_id,))
-    conn.commit()
+    # W8: 显式事务 + 正确删除顺序（feedback 无外键级联，必须先删）
+    with conn:
+        conn.execute("DELETE FROM feedback WHERE conversation_id=?", (conversation_id,))
+        conn.execute("DELETE FROM conversation_messages WHERE conversation_id=?", (conversation_id,))
+        conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
 
 
 def get_chunk_references(chunk_id: int, limit: int = 50) -> list[dict]:

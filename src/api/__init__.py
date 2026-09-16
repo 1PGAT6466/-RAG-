@@ -9,6 +9,7 @@ from src.api.graph import router as graph_router
 from src.api.config import router as config_router
 from src.api.dms import router as dms_router
 from src.api.feedback import router as feedback_router
+from src.api.wiki import router as wiki_router
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -20,6 +21,7 @@ router.include_router(graph_router)
 router.include_router(config_router)
 router.include_router(dms_router)
 router.include_router(feedback_router)
+router.include_router(wiki_router)
 
 # 插件 + MCP 市场路由（保持原有注册方式）
 from src import api_plugins

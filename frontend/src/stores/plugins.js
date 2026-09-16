@@ -5,11 +5,9 @@ export const usePluginsStore = defineStore('plugins', {
   state: () => ({
     plugins: [],       // 插件列表
     loading: false,
-    current: null,     // 当前详情
   }),
   getters: {
     enabledPlugins: (state) => state.plugins.filter(p => p.status === 'enabled'),
-    toolPlugins: (state) => state.plugins.filter(p => p.kind === 'tool'),
   },
   actions: {
     async fetchList() {

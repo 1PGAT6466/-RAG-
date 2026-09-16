@@ -29,9 +29,14 @@ def chunk_text(text: str, source_name: str = "") -> list[dict]:
 
     chunks = []
     idx = 0
+    section_idx = 0  # P7: 父段索引
     for heading, body in sections:
         paras = _split_paragraphs(body)
         current = ""
+        # P7: 记录本 section 的完整文本（用于 parent-child 上下文）
+        section_text = body.strip()[:2000]  # 截断避免过大
+        sid = section_idx
+        section_idx += 1
         for para in paras:
             if not para.strip():
                 continue
@@ -43,6 +48,8 @@ def chunk_text(text: str, source_name: str = "") -> list[dict]:
                     "heading": heading,
                     "source": source_name,
                     "markdown": is_md,
+                    "section_id": sid,
+                    "section_text": section_text,
                 })
                 idx += 1
                 # overlap: 保留末尾部分
@@ -58,6 +65,8 @@ def chunk_text(text: str, source_name: str = "") -> list[dict]:
                             "heading": heading,
                             "source": source_name,
                             "markdown": is_md,
+                            "section_id": sid,
+                            "section_text": section_text,
                         })
                         idx += 1
                 current = ""
@@ -71,6 +80,8 @@ def chunk_text(text: str, source_name: str = "") -> list[dict]:
                 "heading": heading,
                 "source": source_name,
                 "markdown": is_md,
+                "section_id": sid,
+                "section_text": section_text,
             })
             idx += 1
 

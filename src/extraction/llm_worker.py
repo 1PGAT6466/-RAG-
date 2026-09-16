@@ -13,6 +13,7 @@ llm_worker.py — LLM 实体抽取后台调度器（阶段 2）
 import logging
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -29,6 +30,28 @@ _worker: Optional["_LLMWorker"] = None
 _lock = threading.Lock()
 
 
+class _LRUSet:
+    """带容量上限的 LRU 去重集合（基于 OrderedDict），满时淘汰最旧条目。"""
+
+    def __init__(self, maxsize: int = 100_000):
+        self._data = OrderedDict()
+        self._maxsize = maxsize
+
+    def add(self, key):
+        if key in self._data:
+            self._data.move_to_end(key)
+            return
+        if len(self._data) >= self._maxsize:
+            self._data.popitem(last=False)  # 淘汰最旧
+        self._data[key] = True
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __len__(self):
+        return len(self._data)
+
+
 class _LLMWorker:
     """后台 LLM 抽取工作器：线程池 + 去重缓存 + 限流"""
 
@@ -37,10 +60,9 @@ class _LLMWorker:
         self._min_interval = min_interval  # 两次 LLM 调用最短间隔（秒），限流
         self._last_call = 0.0
         self._interval_lock = threading.Lock()
-        # 去重：已做过 LLM 抽取的 chunk_id 集合
-        self._done_chunks: set[int] = set()
+        # S20: 去重用 LRUSet，满时淘汰最旧条目而非整体清空
+        self._done_chunks = _LRUSet(maxsize=100_000)
         self._pending: set[int] = set()  # 排队中的 chunk_id，防重复提交
-        self._done_chunks_max = 100_000  # 去重集上限，超过后清空（避免长驻内存无限增长）
 
     def _throttle(self):
         """限流：确保两次调用间隔 >= min_interval"""
@@ -69,9 +91,6 @@ class _LLMWorker:
             with _lock:
                 self._done_chunks.add(chunk_id)
                 self._pending.discard(chunk_id)
-                if len(self._done_chunks) > self._done_chunks_max:
-                    self._done_chunks.clear()
-                    logger.info(f"[llm_worker] 去重集已达上限，清空（降低内存占用，牺牲少量重复抽取）")
 
     def submit_file(self, file_id: int):
         """提交一个文件的全部 chunk 做后台 LLM 抽取（去重 + 非阻塞 + 可选 max_chunks 限流）"""
@@ -118,7 +137,13 @@ def submit_file(file_id: int):
 
 
 def get_status() -> dict:
-    """返回 LLM 抽取进度（供前端/调试）"""
+    """返回 LLM 抽取进度（供前端/调试）
+
+    返回：
+        - done_chunks: 已完成抽取的 chunk 数
+        - pending_chunks: 排队中的 chunk 数
+        - max_workers: 线程池最大工作线程数
+    """
     w = _get_worker()
     with _lock:
         return {

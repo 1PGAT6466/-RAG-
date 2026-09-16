@@ -45,7 +45,7 @@
           :class="{ active: activeCategory === '' && activeFolder === '' }"
           @click="selectCategory('')">
           <el-icon><Folder /></el-icon> 全部
-          <span class="category-count">{{ files.length }}</span>
+          <span class="category-count">{{ allFiles.length }}</span>
         </div>
         <div class="category-item"
           v-for="cat in categories"
@@ -81,7 +81,7 @@
         />
         <el-button v-if="auth.isAdmin" type="primary" size="small" :icon="Upload" @click="openDmsFolderDialog('file')">上传文档</el-button>
         <el-button v-if="auth.isAdmin" size="small" :icon="Folder" @click="openDmsFolderDialog('folder')">上传文件夹</el-button>
-        <el-button v-if="auth.isAdmin" size="small" :icon="Plus" @click="newFolderVisible = true">新建文件夹</el-button>
+        <el-button v-if="auth.isAdmin" size="small" :icon="Plus" @click="openNewFolderDialog">新建文件夹</el-button>
         <span v-if="uploading" class="docs-upload-status">{{ uploadProgress }}</span>
       </div>
 
@@ -115,7 +115,14 @@
 
       <!-- 新建文件夹弹窗 -->
       <el-dialog v-model="newFolderVisible" title="新建文件夹" width="360px">
-        <el-input v-model="newFolderName" placeholder="文件夹名，如：连接器资料" @keyup.enter="createFolder" />
+        <el-input
+          v-model="newFolderName"
+          placeholder="文件夹名，如：连接器资料"
+          :class="{ 'is-error': newFolderError }"
+          @keyup.enter="createFolder"
+          @input="newFolderError = false"
+        />
+        <div v-if="newFolderError" style="color:var(--color-danger);font-size:12px;margin-top:4px">请输入文件夹名称</div>
         <template #footer>
           <el-button @click="newFolderVisible = false">取消</el-button>
           <el-button type="primary" @click="createFolder">创建</el-button>
@@ -134,7 +141,7 @@
           <el-option
             v-for="f in dmsFolders"
             :key="f.id"
-            :label="formatDmsFolderLabel(f)"
+            :label="formatDmsTreeLabel(f)"
             :value="f.id"
           />
         </el-select>
@@ -171,7 +178,25 @@
       </div>
 
       <div class="docs-list-area">
-        <EmptyState v-if="filteredFiles.length === 0" icon="Folder" title="暂无文档" hint="上传 PDF、PPT、XLSX 或 DOCX 文件开始使用" />
+        <!-- 骨架屏加载态 -->
+        <div v-if="filesLoading" class="doc-list">
+          <div v-for="i in 5" :key="i" class="doc-card" style="cursor:default">
+            <div class="doc-card-header">
+              <SkeletonBlock width="40px" height="40px" radius="8px" />
+              <div style="flex:1">
+                <SkeletonBlock width="70%" height="14px" style="margin-bottom:8px" />
+                <SkeletonBlock width="40%" height="12px" />
+              </div>
+            </div>
+            <div style="display:flex;gap:6px;margin-top:10px">
+              <SkeletonBlock width="60px" height="22px" radius="999px" />
+              <SkeletonBlock width="80px" height="22px" radius="999px" />
+            </div>
+          </div>
+        </div>
+        <EmptyState v-else-if="filteredFiles.length === 0" icon="Folder" title="暂无文档" hint="上传 PDF、PPT、XLSX 或 DOCX 文件开始使用">
+          <template #action><el-button type="primary" @click="triggerUpload">上传文档</el-button></template>
+        </EmptyState>
 
         <!-- 表格视图 -->
         <el-table v-else-if="viewMode === 'table'" :data="filteredFiles" style="width:100%" @row-click="row => $router.push(`/document/${row.id}`)" row-class-name="clickable-row">
@@ -197,6 +222,18 @@
             </template>
           </el-table-column>
           <el-table-column prop="chunk_count" label="块数" width="70" align="center" />
+          <!-- P3: 清洗质量分 -->
+          <el-table-column label="质量" width="80" align="center">
+            <template #default="{ row }">
+              <el-tag
+                v-if="row.quality_score >= 0"
+                :type="qualityTagType(row.quality_score)"
+                size="small"
+                effect="plain"
+              >{{ qualityLabel(row.quality_score) }}{{ row.quality_score }}</el-tag>
+              <span v-else style="color: #909399; font-size: 12px;">—</span>
+            </template>
+          </el-table-column>
           <el-table-column label="大小" width="90">
             <template #default="{ row }">{{ formatSize(row.size) }}</template>
           </el-table-column>
@@ -229,8 +266,10 @@
             <div class="doc-card-tags">
               <span class="tag cat-pill" v-if="f.category" :style="{ background: categoryColor(f.category) }">{{ f.category }}</span>
               <span class="tag" v-if="f.folder && f.folder !== '/'">{{ f.folder }}</span>
-              <span class="tag tag-model" v-for="m in (f.models || []).slice(0, 4)" :key="'m'+m">{{ m }}</span>
-              <span class="tag tag-material" v-for="m in (f.materials || []).slice(0, 4)" :key="'mat'+m">{{ m }}</span>
+              <span class="tag tag-model" v-for="m in (f.models || []).slice(0, 2)" :key="'m'+m">{{ m }}</span>
+              <span v-if="(f.models || []).length > 2" class="tag tag-model">+{{ (f.models || []).length - 2 }}</span>
+              <span class="tag tag-material" v-for="m in (f.materials || []).slice(0, 2)" :key="'mat'+m">{{ m }}</span>
+              <span v-if="(f.materials || []).length > 2" class="tag tag-material">+{{ (f.materials || []).length - 2 }}</span>
             </div>
             <div class="doc-card-actions" v-if="auth.isAdmin">
               <el-button size="small" text type="danger" :icon="Delete" @click.stop="deleteFile(f.id, f.name)">删除</el-button>
@@ -260,7 +299,10 @@ import api from '../api'
 import dmsApi from '../api/dms'
 import { useAuthStore } from '../stores/auth'
 import EmptyState from '../components/EmptyState.vue'
-import { formatDate, iconFor, extLabel, iconStyle, formatSize } from './docs/helpers'
+import SkeletonBlock from '../components/SkeletonBlock.vue'
+import { friendlyError } from '../utils/errors'
+import { confirmDelete } from '../utils/confirm'
+import { formatDate, extLabel, iconStyle, formatSize, qualityTagType, qualityLabel } from './docs/helpers'
 import { categoryColor } from '../constants/category'
 
 const auth = useAuthStore()
@@ -275,6 +317,9 @@ const filterModel = ref('')
 const filterMaterial = ref('')
 const filterDate = ref('')
 const viewMode = ref('card')
+const filesLoading = ref(false)
+const fileInputRef = ref(null)
+const folderInputRef = ref(null)
 
 // 目录树 + AI 找文件
 const folderTree = ref([])
@@ -285,8 +330,7 @@ const findVisible = ref(false)
 const findResults = ref([])
 const newFolderVisible = ref(false)
 const newFolderName = ref('')
-const fileInputRef = ref(null)
-const folderInputRef = ref(null)
+const newFolderError = ref(false)
 // 后台向量化进度任务列表（上传后轮询展示）
 const vectorizeJobs = ref([])
 
@@ -334,6 +378,10 @@ const allMaterials = computed(() => {
 // 筛选变化 → 重新请求后端（带 category/model/material/date 参数），统一筛选逻辑
 function onFilterChange() {
   fetchFiles()
+}
+
+function triggerUpload() {
+  if (fileInputRef.value) fileInputRef.value.click()
 }
 
 function selectCategory(name) {
@@ -392,15 +440,21 @@ async function doFindFile() {
     findVisible.value = true
     if (findResults.value.length === 0) ElMessage.info(data.message || '未找到相关文件')
   } catch (e) {
-    ElMessage.error('找文件失败: ' + (e.userMessage || e.message))
+    ElMessage.error('找文件失败: ' + friendlyError(e))
   } finally {
     finding.value = false
   }
 }
 
+function openNewFolderDialog() {
+  newFolderVisible.value = true
+  newFolderError.value = false
+  newFolderName.value = ''
+}
+
 async function createFolder() {
   const name = newFolderName.value.trim()
-  if (!name) { ElMessage.warning('请输入文件夹名'); return }
+  if (!name) { newFolderError.value = true; return }
   // 创建一个空文件夹：用 add_file 之外的方式？这里通过移动第一个文件无法实现，
   // 改为：前端本地创建后，提示用户上传时选择该目录。
   // 当前目录树是「虚拟目录」，基于文件 folder 字段派生，无独立文件夹实体。
@@ -408,6 +462,7 @@ async function createFolder() {
   activeFolder.value = '/' + name.replace(/^\/+/, '')
   newFolderVisible.value = false
   newFolderName.value = ''
+  newFolderError.value = false
   ElMessage.success(`已选中目录「${activeFolder.value}」，后续上传的文件将归入此目录`)
 }
 
@@ -419,15 +474,13 @@ async function moveToFolder(fileId, folder) {
     await fetchFolders()
     await fetchAllFiles()
   } catch (e) {
-    ElMessage.error('移动失败: ' + (e.userMessage || e.message))
+    ElMessage.error('移动失败: ' + friendlyError(e))
   }
 }
 
 async function deleteFile(fileId, fileName) {
   try {
-    await ElMessageBox.confirm(`确定删除「${fileName}」吗？删除后不可恢复。`, '删除确认', {
-      type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
-    })
+    await confirmDelete(`确定删除「${fileName}」吗？删除后不可恢复。`)
   } catch { return }
   try {
     await api.delete(`/documents/${fileId}`)
@@ -436,7 +489,7 @@ async function deleteFile(fileId, fileName) {
     await fetchFolders()
     await fetchAllFiles()
   } catch (e) {
-    ElMessage.error('删除失败: ' + (e.userMessage || e.message))
+    ElMessage.error('删除失败: ' + friendlyError(e))
   }
 }
 
@@ -451,6 +504,7 @@ async function fetchAllFiles() {
 }
 
 async function fetchFiles() {
+  filesLoading.value = true
   try {
     const params = {}
     if (activeCategory.value) params.category = activeCategory.value
@@ -461,7 +515,9 @@ async function fetchFiles() {
     const { data } = await api.get('/documents', { params })
     files.value = data.data || []
   } catch (e) {
-    ElMessage.error('加载文档列表失败')
+    ElMessage.error('加载文档列表失败: ' + friendlyError(e))
+  } finally {
+    filesLoading.value = false
   }
 }
 
@@ -473,7 +529,7 @@ function onFilesSelected(e) {
 }
 
 // === DMS 目标文件夹选择 ===
-function formatDmsFolderLabel(f) {
+function formatDmsTreeLabel(f) {
   // folderList 形如 ":1:2:"，用其层级数量作缩进
   const depth = (f.folderList || '').split(':').filter(Boolean).length
   return '　'.repeat(depth) + f.name
@@ -490,7 +546,7 @@ async function openDmsFolderDialog(type) {
     // 默认选中根文件夹
     if (dmsFolders.value.length) targetDmsFolderId.value = dmsFolders.value[0].id
   } catch (e) {
-    ElMessage.error('拉取 DMS 文件夹失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('拉取 DMS 文件夹失败: ' + friendlyError(e))
   } finally {
     dmsFolderLoading.value = false
   }
@@ -530,12 +586,12 @@ async function uploadFilesSeq(filesList, idx) {
       ElMessage.success(`${file.name} 已存入 DMS`)
     }
   } catch (e) {
-    ElMessage.error(`${file.name} 上传失败: ` + (e.response?.data?.detail || e.message))
+    ElMessage.error(`${file.name} 上传失败: ` + friendlyError(e))
   } finally {
     uploading.value = false
     uploadProgress.value = ''
   }
-  // 继续下一个文件
+  // 继续下一个文件（间隔 300ms 避免后端过载）
   setTimeout(() => uploadFilesSeq(filesList, idx + 1), 300)
 }
 
@@ -572,8 +628,16 @@ function jobStatusText(job) {
   }
 }
 
+/**
+ * pollVectorizeJob — 后台轮询向量化任务进度
+ *
+ * 流程：每 2s 轮询 /documents/upload/{dmsId}/vectorize-status
+ *   - done → 刷新文件列表，4s 后移除进度条
+ *   - failed → 显示错误，停止轮询
+ *   - running → 拉取 task progress 更新进度百分比
+ * 可取消：组件卸载时 _pollAbort.abort() 终止所有等待中的 sleep
+ */
 async function pollVectorizeJob(dmsId, job) {
-  // 可取消轮询：组件卸载时 _pollAbort.abort() 终止所有等待中的 sleep
   if (!_pollAbort || _pollAbort.signal.aborted) _pollAbort = new AbortController()
   const signal = _pollAbort.signal
 
@@ -623,8 +687,14 @@ async function pollVectorizeJob(dmsId, job) {
   }
 }
 
-onMounted(() => {
-  fetchAllFiles()
+onMounted(async () => {
+  filesLoading.value = true
+  try {
+    await fetchAllFiles()
+    files.value = allFiles.value  // 初始显示全量列表
+  } finally {
+    filesLoading.value = false
+  }
   fetchFolders()
 })
 </script>

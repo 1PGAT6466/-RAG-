@@ -17,17 +17,20 @@ class ConversationCreateReq(BaseModel):
 
 @router.get("/api/conversations")
 def api_list_conversations(user=Depends(get_current_user)):
+    """获取当前用户的会话列表"""
     return {"status": "ok", "data": list_conversations(user.get("user_id"))}
 
 
 @router.post("/api/conversations")
 def api_create_conversation(req: ConversationCreateReq, user=Depends(get_current_user)):
+    """创建新会话"""
     cid = create_conversation(user.get("user_id"), req.title)
     return {"status": "ok", "data": {"id": cid, "title": req.title}}
 
 
 @router.get("/api/conversations/{conversation_id}")
 def api_get_conversation(conversation_id: int, user=Depends(get_current_user)):
+    """获取会话详情（含所有消息）"""
     conv = get_conversation(conversation_id, user_id=user.get("user_id"))
     if not conv:
         raise HTTPException(404, "会话不存在")
@@ -37,6 +40,7 @@ def api_get_conversation(conversation_id: int, user=Depends(get_current_user)):
 
 @router.delete("/api/conversations/{conversation_id}")
 def api_delete_conversation(conversation_id: int, user=Depends(get_current_user)):
+    """删除会话（含所有消息）"""
     conv = get_conversation(conversation_id, user_id=user.get("user_id"))
     if not conv:
         raise HTTPException(404, "会话不存在")

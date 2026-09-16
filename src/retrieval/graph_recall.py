@@ -63,7 +63,7 @@ def detect_query_entities(query: str) -> list[dict]:
 # 实体 → chunk 反查
 # ============================================================
 
-def _entity_to_chunks(entity: dict, limit: int = 20) -> list[dict]:
+def _entity_to_chunks(entity: dict, limit: int = 10) -> list[dict]:
     """命中实体 → 反查被它提到的 chunk（含精确位置锚点）"""
     ent = db.get_entity_by_name(entity["name"], entity["type"])
     if not ent:
@@ -105,6 +105,9 @@ def _neighbor_chunks(entity: dict, limit: int = 20) -> list[dict]:
     for nb in neighbors[:30]:
         # 邻居实体 id（关系另一端）
         nb_id = nb["target_id"] if nb["source_id"] == ent["id"] else nb["source_id"]
+        # 自环防护：跳过自身
+        if nb_id == ent["id"]:
+            continue
         chunks = db.get_entity_chunks(nb_id)
         for c in chunks:
             cid = c["chunk_id"]

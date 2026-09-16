@@ -185,17 +185,27 @@ def ensure_synced() -> int:
 
     from src.storage.connection import _get_conn
     conn = _get_conn()
-    rows = conn.execute(
-        "SELECT id, file_id, chunk_index, content, embedding FROM chunks "
-        "WHERE embedding IS NOT NULL"
-    ).fetchall()
-
-    to_add = [r for r in rows if r['id'] not in existing]
-    if to_add:
-        add_batch([(r['id'], r['embedding'], r['content'], r['file_id'], r['chunk_index'])
-                   for r in to_add])
-        logger.info(f"Chroma 补齐 {len(to_add)} 条（总数 {count()}）")
-    return len(to_add)
+    # 分批加载，避免全量 chunks + embedding 一次性进内存（大库数百 MB）
+    total_synced = 0
+    batch_size = 1000
+    offset = 0
+    while True:
+        rows = conn.execute(
+            "SELECT id, file_id, chunk_index, content, embedding FROM chunks "
+            "WHERE embedding IS NOT NULL LIMIT ? OFFSET ?",
+            (batch_size, offset)
+        ).fetchall()
+        if not rows:
+            break
+        to_add = [r for r in rows if r['id'] not in existing]
+        if to_add:
+            add_batch([(r['id'], r['embedding'], r['content'], r['file_id'], r['chunk_index'])
+                       for r in to_add])
+            total_synced += len(to_add)
+        offset += batch_size
+    if total_synced:
+        logger.info(f"Chroma 补齐 {total_synced} 条（总数 {count()}）")
+    return total_synced
 
 
 def count() -> int:

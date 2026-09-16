@@ -18,19 +18,20 @@ Stage 分两类：
   - RAG_INGEST_MAX_CONCURRENT（默认 3）：入库信号量，避免批量上传 OOM
   - _wait_for_file：无进展超时（progress/stage/chunks 变即重置计时），大文档不误判
 
-任务状态机：
-  pending → running → done/failed/cancelled
-  任务状态驻留内存（_tasks dict），重启后通过 recover_tasks 从 DB 恢复
+任务状态机（P20 增强）：
+  pending → running → done / failed / retrying
+  retrying → pending（退避到期后自动回到 pending → running）
+  重试耗尽 → dead_letter=1（死信队列，可查不可自动重试）
+
+断点续跑：
+  每个 sync Stage 完成后保存 checkpoint（stage名 + 上下文数据），
+  服务重启后从 checkpoint 位置续跑，不从头来。
 
 大规模文档路径：
   PDF ≥ 20 页走流式（parse_pdf_streaming），逐页解析+增量 embed，避免 OOM
   chunk 数 > EMBED_REMOTE_THRESHOLD(300) 自动切远程 embedding API
-
-触发器（trigger）只是"把文件喂给引擎"的入口，不各自实现逻辑：
-  - HTTP 上传 → enqueue()
-  - 文件夹监控 → watch_folder.py 轮询到新文件 → enqueue()
-  - cron → cron 任务调用 enqueue()
 """
+import json
 import logging
 import threading
 import time
@@ -38,29 +39,51 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
+import httpx
+
 from config import UPLOAD_DIR, RAG_STREAM_INGEST, RAG_STREAM_MIN_PAGES, RAG_STREAM_FLUSH_PAGES, RAG_INGEST_MAX_CONCURRENT
 
 logger = logging.getLogger("rag.engine")
 
 # ============================================================
-# 任务状态机
+# 任务状态机（P20 增强）
 # ============================================================
-# pending -> running -> done | failed
-# running 内部有 detail 字段描绘当前 Stage
 _tasks: dict[str, dict] = {}
 _lock = threading.Lock()
-
-# 入库并发限流：信号量上限=RAG_INGEST_MAX_CONCURRENT。
-# enqueue 仍立即返回 task_id（状态 pending），但 worker 线程启动后先 acquire 信号量
-# 才真正执行 _run，超限的任务线程阻塞排队，避免批量上传时线程爆炸 OOM。
 _ingest_semaphore = threading.BoundedSemaphore(max(1, RAG_INGEST_MAX_CONCURRENT))
-
-# 任务状态驻留内存上限：达到后淘汰最旧的已完成任务，避免长时间运行内存无限增长
 _MAX_TASKS = 1000
+
+# 重试参数（与 tasks.py 一致）
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 5.0   # 首次重试延迟（秒）
+_RETRY_BACKOFF = 2.0       # 退避倍数
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """判断是否为瞬时错误（值得重试）。
+
+    瞬时：LLM 超时、网络抖动、429 限流、连接重置
+    持久：文件不存在、解析失败、内容为空、格式错误
+    """
+    msg = str(exc).lower()
+    # 瞬时错误关键词
+    transient_keywords = [
+        "timeout", "超时", "timed out",
+        "429", "rate limit", "限流",
+        "connection", "连接", "reset", "eof",
+        "502", "503", "504",
+        "temporary", "暂时",
+    ]
+    for kw in transient_keywords:
+        if kw in msg:
+            return True
+    # 某些异常类型本身就是瞬时的
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, ConnectionError, TimeoutError)):
+        return True
+    return False
 
 
 def _evict_old_tasks():
-    """淘汰最旧的已完成任务（done/failed），保留 running/pending，控制内存"""
     if len(_tasks) <= _MAX_TASKS:
         return
     finished = [(tid, t) for tid, t in _tasks.items()
@@ -92,33 +115,31 @@ def _emit(task_id: str, stage: str, progress: int, text: str):
             logger.warning(f"[引擎] 任务持久化失败（已忽略）: {e}")
 
 
+def _save_checkpoint(task_id: str, stage: str, data: dict = None):
+    """保存 Stage 断点（每完成一个 sync Stage 调用一次）"""
+    with _lock:
+        t = _tasks.get(task_id)
+        if t:
+            t["checkpoint_stage"] = stage
+            t["checkpoint_data"] = data or {}
+    try:
+        from src.storage.db import save_checkpoint
+        save_checkpoint(task_id, stage, data or {})
+    except Exception as e:
+        logger.warning(f"[引擎] 断点保存失败（已忽略）: {e}")
+
+
 # ============================================================
 # Stage 注册表
 # ============================================================
-# 每个 Stage 是 (name, fn)，fn 签名：fn(ctx: dict) -> dict（返回本阶段产物，写入 ctx）
-# ctx 会在所有 Stage 间传递，携带 file_id / chunks / text / 等中间产物
 _sync_stages: list[tuple[str, Callable]] = []
 _async_stages: list[tuple[str, Callable]] = []
-
-
-# 每个 Stage 的元数据：name -> 是否 critical（失败则整任务失败，而非降级跳过）
 _critical_stages: dict[str, bool] = {}
 
 
 def register_stage(name: str, stage_type: str = "sync", critical: bool = False):
-    """注册 Stage 的装饰器。stage_type ∈ {'sync','async'}
-
-    用法：
-        @register_stage("embed", stage_type="sync", critical=True)
-        def _stage_embed(ctx): ...
-
-    sync  ：入库必跑、快速、失败降级
-    async ：后处理增强，后台线程执行
-    critical：True 则该 Stage 失败会导致整任务失败（如向量化/入库这类不可缺的）
-    """
     if critical:
         _critical_stages[name] = True
-
     def deco(fn: Callable):
         if stage_type == "async":
             _async_stages.append((name, fn))
@@ -153,9 +174,15 @@ def enqueue(filepath: str, filename: str = None) -> str:
             "tags": [],
             "error": None,
             "created_at": time.time(),
+            # P20: 重试字段
+            "retry_count": 0,
+            "max_retries": _MAX_RETRIES,
+            "next_retry_at": 0,
+            "dead_letter": 0,
+            "checkpoint_stage": "",
+            "checkpoint_data": {},
         }
         _evict_old_tasks()
-    # 持久化初始状态
     try:
         from src.storage.db import save_task
         save_task(_tasks[task_id])
@@ -168,11 +195,6 @@ def enqueue(filepath: str, filename: str = None) -> str:
 
 
 def _run_with_limit(task_id: str):
-    """并发限流包装：先 acquire 信号量再执行 _run，超限任务阻塞排队。
-
-    保持 enqueue 立即返回、任务状态 pending 的契约；真正执行时才占并发位。
-    信号量释放放在 finally，异常/正常/清理路径都保证归还。
-    """
     _ingest_semaphore.acquire()
     try:
         _run(task_id)
@@ -183,7 +205,17 @@ def _run_with_limit(task_id: str):
 def get_status(task_id: str) -> Optional[dict]:
     with _lock:
         t = _tasks.get(task_id)
-    return dict(t) if t else None
+    if t:
+        return dict(t)
+    # W1: 内存无此 task，从 SQLite 补查（服务重启后已完成任务）
+    try:
+        from src.storage.tasks import load_task
+        row = load_task(task_id)
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    return None
 
 
 def list_tasks() -> list[dict]:
@@ -192,7 +224,7 @@ def list_tasks() -> list[dict]:
 
 
 def _run(task_id: str):
-    """引擎主循环：按顺序跑 sync stages，再异步跑 async stages"""
+    """引擎主循环：按顺序跑 sync stages，支持断点续跑"""
     with _lock:
         t = _tasks[task_id]
     ctx = {
@@ -202,33 +234,104 @@ def _run(task_id: str):
         "emit": lambda stage, progress, text: _emit(task_id, stage, progress, text),
     }
 
+    # P20: 断点续跑 — 如果有 checkpoint，从 checkpoint 之后的 Stage 开始
+    checkpoint_stage = t.get("checkpoint_stage", "")
+    checkpoint_data = t.get("checkpoint_data", {})
+    if checkpoint_stage and checkpoint_data:
+        ctx.update(checkpoint_data)
+        logger.info(f"[引擎] 从断点续跑: {task_id} → checkpoint={checkpoint_stage}")
+
     try:
         _emit(task_id, "prepare", 2, "准备文件...")
-        _prepare(ctx)
+        if not checkpoint_stage:
+            _prepare(ctx)
+        else:
+            # 续跑时复用已有 target_path
+            ctx["target_path"] = checkpoint_data.get("target_path", t["filepath"])
+            ctx["ext"] = checkpoint_data.get("ext", Path(t["filepath"]).suffix.lower())
 
-        # 流式路径：大 PDF（需逐页解析/OCR）走边解析边入库，尽快可检索
+        # 流式路径：大 PDF 走边解析边入库
         if ctx["ext"] == ".pdf" and _use_streaming(ctx):
             _run_streaming_pdf(task_id, ctx)
         else:
-            _run_sync(task_id, ctx)
+            _run_sync(task_id, ctx, skip_until=checkpoint_stage)
     except Exception as e:
         import traceback
         logger.error(f"[引擎] 任务失败 {task_id}: {e}\n{traceback.format_exc()}")
-        with _lock:
-            _tasks[task_id].update(status="failed", progress=100, stage="failed", progress_text="失败", error=str(e))
-        # 持久化失败状态
-        try:
-            from src.storage.db import save_task
-            save_task(_tasks[task_id])
-        except Exception:
-            pass
+        _handle_failure(task_id, t, e)
     finally:
-        # 清理上传临时文件（_tmp_ 前缀），避免大文件上传后残留占用磁盘
-        _cleanup_tmp(ctx["filepath"])
+        _cleanup_tmp(ctx.get("filepath", t.get("filepath", "")))
+
+
+def _handle_failure(task_id: str, task: dict, error: Exception):
+    """P20: 失败处理 — 瞬时错误自动重试，持久错误直接 failed。
+
+    指数退避：5s → 10s → 20s，超过 max_retries 进死信队列。
+    """
+    retry_count = task.get("retry_count", 0)
+    max_retries = task.get("max_retries", _MAX_RETRIES)
+
+    if _is_transient_error(error) and retry_count < max_retries:
+        # 瞬时错误 + 还有重试次数 → 调度重试
+        delay = _RETRY_BASE_DELAY * (_RETRY_BACKOFF ** retry_count)
+        next_retry_at = time.time() + delay
+        new_retry_count = retry_count + 1
+
+        with _lock:
+            task.update(
+                status="retrying",
+                retry_count=new_retry_count,
+                error=str(error),
+                next_retry_at=next_retry_at,
+                progress_text=f"瞬时错误，{delay:.0f}s 后第 {new_retry_count} 次重试",
+            )
+
+        try:
+            from src.storage.db import mark_task_retrying
+            mark_task_retrying(task_id, new_retry_count, str(error), next_retry_at)
+        except Exception as e2:
+            logger.warning(f"[引擎] 标记重试状态失败: {e2}")
+
+        logger.warning(
+            f"[引擎] 瞬时错误，自动重试: {task_id} "
+            f"(第{new_retry_count}/{max_retries}次, {delay:.0f}s后) error={error}"
+        )
+    else:
+        # 持久错误 或 重试耗尽 → 死信队列
+        if retry_count >= max_retries:
+            with _lock:
+                task.update(
+                    status="failed",
+                    progress=100,
+                    stage="failed",
+                    progress_text=f"重试耗尽（{max_retries}次），永久失败",
+                    error=str(error),
+                    dead_letter=1,
+                )
+            try:
+                from src.storage.db import mark_task_dead
+                mark_task_dead(task_id, str(error))
+            except Exception:
+                pass
+            logger.error(f"[引擎] 重试耗尽，进入死信队列: {task_id} error={error}")
+        else:
+            with _lock:
+                task.update(
+                    status="failed",
+                    progress=100,
+                    stage="failed",
+                    progress_text="失败",
+                    error=str(error),
+                )
+            try:
+                from src.storage.db import save_task
+                save_task(task)
+            except Exception:
+                pass
+            logger.error(f"[引擎] 持久错误，任务失败: {task_id} error={error}")
 
 
 def _prepare(ctx: dict):
-    """准备阶段：复制文件到 uploads"""
     src = Path(ctx["filepath"])
     dest = UPLOAD_DIR / ctx["filename"]
     if src.resolve() != dest.resolve():
@@ -239,7 +342,6 @@ def _prepare(ctx: dict):
 
 
 def _cleanup_tmp(src_path: str):
-    """清理上传临时文件（_tmp_ 前缀），避免大文件上传后残留"""
     try:
         from pathlib import Path
         p = Path(src_path)
@@ -251,10 +353,8 @@ def _cleanup_tmp(src_path: str):
 
 
 def _use_streaming(ctx: dict) -> bool:
-    """是否走流式 PDF 路径。默认开启（RAG_STREAM_INGEST=1），小文件可关。"""
     if RAG_STREAM_INGEST != "1":
         return False
-    # 小 PDF（页数阈值内）不值得流式，整本解析更快
     try:
         import fitz
         with fitz.open(ctx["target_path"]) as doc:
@@ -265,11 +365,20 @@ def _use_streaming(ctx: dict) -> bool:
     return pages >= threshold
 
 
-def _run_sync(task_id: str, ctx: dict):
-    """原同步链路：顺序跑 sync stages，再异步跑 async stages"""
-    # 顺序执行 sync stages
+def _run_sync(task_id: str, ctx: dict, skip_until: str = ""):
+    """同步链路：顺序跑 sync stages，支持从断点跳过已完成的 Stage"""
     n = len(_sync_stages)
+    skipping = bool(skip_until)
     for i, (name, fn) in enumerate(_sync_stages):
+        # 断点续跑：跳过 checkpoint 之前已完成的 Stage
+        if skipping:
+            if name == skip_until:
+                skipping = False
+                logger.info(f"[引擎] 断点续跑: 从 {name} 开始")
+            else:
+                logger.info(f"[引擎] 跳过已完成 Stage: {name}")
+                continue
+
         _emit(task_id, name, int((i + 1) / (n + 1) * 90), f"执行 {name}...")
         try:
             fn(ctx)
@@ -279,11 +388,18 @@ def _run_sync(task_id: str, ctx: dict):
                 raise
             logger.warning(f"[引擎] Stage {name} 失败（降级继续）: {e}")
 
+        # P20: 每完成一个 sync Stage 保存断点
+        _save_checkpoint(task_id, name, {
+            "target_path": ctx.get("target_path", ""),
+            "ext": ctx.get("ext", ""),
+            "file_id": ctx.get("file_id"),
+            "chunk_count": ctx.get("chunk_count", 0),
+        })
+
     _finish_sync(task_id, ctx)
 
 
 def _finish_sync(task_id: str, ctx: dict):
-    """汇总基础结果 + 异步后处理 + on_ingest hook + 置完成"""
     with _lock:
         _tasks[task_id].update(
             status="done",
@@ -293,18 +409,17 @@ def _finish_sync(task_id: str, ctx: dict):
             chunks=ctx.get("chunk_count", 0),
             category=ctx.get("category", ""),
             file_id=ctx.get("file_id"),
+            # P20: 完成后清除断点（不再需要续跑）
+            checkpoint_stage="",
+            checkpoint_data={},
         )
     logger.info(f"[引擎] 基础入库完成: {task_id} → {ctx.get('filename')}")
 
-    # on_ingest hook（插件挂载点，后台线程容错执行，不阻塞主链路）
     _run_on_ingest_hook(ctx)
-
-    # 异步后处理（摘要/标签/预索引），不阻塞状态置 done
     _run_async_stages(task_id, ctx)
 
     with _lock:
         _tasks[task_id].update(status="done", progress=100, progress_text="完成", stage="done")
-    # 持久化最终状态
     try:
         from src.storage.db import save_task
         save_task(_tasks[task_id])
@@ -313,14 +428,12 @@ def _finish_sync(task_id: str, ctx: dict):
 
 
 def _run_on_ingest_hook(ctx: dict):
-    """触发 on_ingest 插件事件（后台线程，容错，不阻塞）"""
     payload = {
         "file_id": ctx.get("file_id"),
         "filename": ctx.get("filename"),
         "chunk_count": ctx.get("chunk_count", 0),
         "category": ctx.get("category", ""),
     }
-
     def _worker():
         try:
             from src.plugins.hooks import run_hook
@@ -329,16 +442,10 @@ def _run_on_ingest_hook(ctx: dict):
                 logger.info(f"[引擎] on_ingest hook 已触发: {[c['plugin'] for c in res['calls'] if c.get('status')=='ok']}")
         except Exception as e:
             logger.warning(f"on_ingest hook 异常（已忽略）: {e}")
-
     threading.Thread(target=_worker, daemon=True).start()
 
 
 def _run_streaming_pdf(task_id: str, ctx: dict):
-    """流式 PDF 入库：边解析边分块→向量化→追加入库。
-
-    目标：丢进去后几分钟内即可检索到已识别的部分（首个小 batch 可搜），
-    而不是等整本解析完才能搜。
-    """
     import os
     from .parser import parse_pdf_streaming
     from .chunker import chunk_text, clean_chunks
@@ -347,9 +454,6 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
     from src.storage.chroma_store import add_batch as chroma_add_batch, _use_chroma
 
     target = ctx["target_path"]
-
-    # 判断是否强制远程 embedding：大 PDF（页数超阈值）本地 CPU embedding 太慢，
-    # 逐批 embed 时直接走 SiliconFlow 远程（代价：少量 API 费用，换取分钟级完成）
     force_remote_embed = False
     try:
         import fitz
@@ -362,7 +466,6 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
     except Exception as e:
         logger.warning(f"判断强制远程失败（默认本地）: {e}")
 
-    # 先建文件记录（这样文件列表里立刻可见，状态可追踪）
     file_id = add_file(
         name=ctx["filename"], path=target, ext=".pdf",
         size=os.path.getsize(target)
@@ -371,21 +474,18 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
 
     flush_pages = int(RAG_STREAM_FLUSH_PAGES)
     global_chunk_idx = 0
-    all_batch_texts = []  # 收集整本（供摘要/分类用）
+    all_batch_texts = []
     total_chunks = 0
 
     def on_batch(batch_text: str, done_pages: int, total_pages: int):
         nonlocal global_chunk_idx, total_chunks
-        # 分块 + 清洗（与同步链路的 chunk→clean 两段解耦保持一致）
         chunks = chunk_text(batch_text, source_name=ctx["filename"])
         if not chunks:
             return
         chunks = clean_chunks(chunks)
         if not chunks:
             return
-        # 重新编号（全局连续）
         contents = [c["content"] for c in chunks]
-        # 向量化（带进度回调：大 batch 嵌入时逐批上报，避免长时间无反馈）
         def _embed_progress(done, total_n):
             _emit(task_id, "streaming",
                   int(done_pages / total_pages * 90),
@@ -395,11 +495,12 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
         rows = [
             (file_id, global_chunk_idx + j, chunks[j]["content"], token_counts[j],
              embeddings[j], {"heading": chunks[j]["heading"], "source": chunks[j]["source"],
-                            "markdown": bool(chunks[j].get("markdown"))})
+                            "markdown": bool(chunks[j].get("markdown")),
+                            "section_id": chunks[j].get("section_id"),
+                            "section_text": (chunks[j].get("section_text") or "")[:1000]})
             for j in range(len(chunks))
         ]
         chunk_ids = add_chunks_batch(rows)
-        # ChromaDB 追加
         if _use_chroma():
             try:
                 chroma_add_batch([
@@ -415,10 +516,8 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
               f"流式入库 {done_pages}/{total_pages} 页（已索引 {total_chunks} 块）")
         all_batch_texts.append(batch_text)
 
-    # 流式解析（阻塞直到整本完成，但每批都实时入库）
     full_text = parse_pdf_streaming(target, on_batch, flush_pages=flush_pages)
 
-    # 同步 chunk_count
     try:
         sync_chunk_count(file_id)
     except Exception as e:
@@ -430,7 +529,6 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
     if total_chunks == 0:
         raise ValueError("文档无有效内容")
 
-    # classify + extract：复用已有 Stage 逻辑（它们只依赖 ctx/file_id）
     _emit(task_id, "classify", 92, "自动分类...")
     try:
         from .ingest_stages import _stage_classify, _stage_extract
@@ -443,7 +541,6 @@ def _run_streaming_pdf(task_id: str, ctx: dict):
 
 
 def _run_async_stages(task_id: str, ctx: dict):
-    """后台跑 async stages，完成后更新 task 的 summary/tags 等字段"""
     def _worker():
         try:
             for name, fn in _async_stages:
@@ -451,7 +548,6 @@ def _run_async_stages(task_id: str, ctx: dict):
                     fn(ctx)
                 except Exception as e:
                     logger.warning(f"[引擎] 异步 Stage {name} 失败（已跳过）: {e}")
-            # 回写后处理结果到任务状态
             with _lock:
                 _tasks[task_id].update(
                     summary=ctx.get("summary"),
@@ -459,33 +555,110 @@ def _run_async_stages(task_id: str, ctx: dict):
                 )
         except Exception as e:
             logger.warning(f"[引擎] 异步后处理线程异常: {e}")
-
     threading.Thread(target=_worker, daemon=True).start()
 
 
 # ============================================================
-# 内置 Stage 注册（实际实现放各自模块，这里只做挂载）
+# 重试调度器（定期扫描 retrying 任务，到期后重新入队）
+# ============================================================
+_retry_scheduler_started = False
+_retry_lock = threading.Lock()
+
+
+def _start_retry_scheduler():
+    """启动重试调度线程：每 10 秒扫描一次 retrying 任务，到期的重新入队执行"""
+    global _retry_scheduler_started
+    with _retry_lock:
+        if _retry_scheduler_started:
+            return
+        _retry_scheduler_started = True
+
+    def _scheduler_loop():
+        while True:
+            try:
+                time.sleep(10)
+                _process_retry_queue()
+            except Exception as e:
+                logger.warning(f"[引擎] 重试调度器异常（已忽略）: {e}")
+
+    t = threading.Thread(target=_scheduler_loop, daemon=True, name="retry-scheduler")
+    t.start()
+    logger.info("[引擎] 重试调度器已启动（每10s扫描）")
+
+
+def _process_retry_queue():
+    """扫描 retrying 任务，到期的重新入队"""
+    try:
+        from src.storage.db import load_retryable_tasks
+        retryable = load_retryable_tasks()
+    except Exception as e:
+        logger.warning(f"[引擎] 加载重试队列失败: {e}")
+        return
+
+    for task in retryable:
+        tid = task["task_id"]
+        with _lock:
+            if tid in _tasks:
+                _tasks[tid].update(status="pending", progress_text="重试中...")
+            else:
+                _tasks[tid] = task
+                _tasks[tid]["status"] = "pending"
+                _tasks[tid]["progress_text"] = "重试中..."
+
+        try:
+            from src.storage.db import save_task
+            save_task(_tasks[tid])
+        except Exception:
+            pass
+
+        logger.info(f"[引擎] 重试任务重新入队: {tid} (第{task.get('retry_count', 0)}次)")
+        t = threading.Thread(target=_run_with_limit, args=(tid,), daemon=True)
+        t.start()
+
+
+# ============================================================
+# 内置 Stage 注册
 # ============================================================
 def _register_builtin_stages():
-    """挂载内置 Stage（延迟 import，避免循环依赖）"""
     from . import ingest_stages  # noqa: F401
-
 
 _register_builtin_stages()
 
+# P20: 启动重试调度器
+_start_retry_scheduler()
+
 
 # ============================================================
-# 启动恢复（从 DB 加载任务状态，标记中断任务）
+# 启动恢复（P20 改造：断点续跑 + 重试恢复）
 # ============================================================
 def recover_tasks():
-    """服务启动时调用：把上次中断的 running/pending 任务标记为 failed，加载历史任务到内存"""
+    """服务启动时调用：
+    1. 把上次中断的 running/pending 任务标为 pending（可恢复，非 failed）
+    2. 有 checkpoint 的任务立即重新入队（断点续跑）
+    3. retrying 且到期的任务重新入队（继续重试）
+    """
     try:
-        from src.storage.db import mark_stale_tasks_failed, load_tasks
+        from src.storage.db import mark_stale_tasks_failed, load_tasks, load_resumable_tasks
+
+        # Step 1: 把中断的 running/pending 标为 pending（非 failed）
         mark_stale_tasks_failed()
+
+        # Step 2: 加载所有任务到内存
         for t in load_tasks():
             tid = t["task_id"]
             if tid not in _tasks:
                 _tasks[tid] = t
-        logger.info(f"[引擎] 任务恢复完成，加载 {len(_tasks)} 个历史任务")
+
+        # Step 3: 有 checkpoint 的任务立即重新入队（断点续跑）
+        resumable = load_resumable_tasks()
+        resumed = 0
+        for t in resumable:
+            tid = t["task_id"]
+            logger.info(f"[引擎] 断点续跑: {tid} → 从 {t['checkpoint_stage']} 继续")
+            threading.Thread(target=_run_with_limit, args=(tid,), daemon=True).start()
+            resumed += 1
+
+        # Step 4: retrying 且到期的任务由重试调度器自动处理
+        logger.info(f"[引擎] 任务恢复完成: 加载 {len(_tasks)} 个, 续跑 {resumed} 个")
     except Exception as e:
         logger.warning(f"[引擎] 任务恢复失败（已忽略）: {e}")

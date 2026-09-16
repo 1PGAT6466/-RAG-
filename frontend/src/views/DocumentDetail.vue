@@ -1,5 +1,6 @@
 <template>
   <div style="height:100%;overflow-y:auto;padding:24px">
+    <PageBack to="/documents" label="返回文档" />
     <div v-if="loadError" class="empty-state">
       <el-icon style="font-size:48px"><CircleClose /></el-icon>
       <p>{{ loadError }}</p>
@@ -21,8 +22,9 @@
         </div>
         <!-- 文档管理操作（仅管理员可见）：删除 + 改分类/标签 -->
         <div class="doc-head-actions">
-          <el-button size="small" :icon="Document" @click="openWithWps">用 WPS 打开</el-button>
-          <el-button size="small" :icon="Download" @click="exportMarkdown">导出 Markdown</el-button>
+          <el-button v-if="canPreview" size="small" :icon="View" @click="previewVisible = true">预览</el-button>
+          <el-button v-if="auth.isAdmin" size="small" :icon="Download" @click="downloadFile">下载</el-button>
+          <el-button v-if="auth.isAdmin" size="small" @click="exportMarkdown">导出 MD</el-button>
           <el-dropdown v-if="auth.isAdmin" trigger="click" @command="onAction">
             <el-button size="small">管理</el-button>
             <template #dropdown>
@@ -106,7 +108,17 @@
         </template>
       </div>
       <div v-else class="doc-body">
-        <div v-for="(sec, si) in sectionedChunks" :key="'sec'+si" class="doc-section">
+        <!-- 分页控件（chunk > 50 时显示） -->
+        <div v-if="totalChunks > PAGE_SIZE" style="margin-bottom:12px">
+          <el-pagination
+            v-model:current-page="chunkPage"
+            :page-size="PAGE_SIZE"
+            :total="totalChunks"
+            layout="total, prev, pager, next"
+            small
+          />
+        </div>
+        <div v-for="(sec, si) in pagedSectionedChunks" :key="'sec'+si" class="doc-section">
           <div v-if="sec.heading" class="doc-section-title" :id="'sec-'+si">
             <span class="doc-section-icon">▸</span>{{ sec.heading }}
             <span class="doc-section-count">{{ sec.chunks.length }} 块</span>
@@ -142,20 +154,27 @@
         <img :src="imagePreviewSrc" style="max-width:100%;height:auto;border-radius:8px" />
       </div>
     </el-dialog>
+
+    <!-- 文件预览弹窗 -->
+    <FilePreview v-model="previewVisible" :file-id="file?.id" :file-name="file?.name" :ext="file?.ext" />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, nextTick, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Loading, CircleClose, Connection, Document, Download, ChatDotRound, ArrowDown, ArrowUp } from '@element-plus/icons-vue'
+import { Loading, CircleClose, Connection, Download, ChatDotRound, ArrowDown, ArrowUp, View } from '@element-plus/icons-vue'
 import LoadingBlock from '../components/LoadingBlock.vue'
+import FilePreview from '../components/FilePreview.vue'
+import PageBack from '../components/PageBack.vue'
 // ElMessage/ElMessageBox 由 unplugin-auto-import 自动引入（含样式）
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import api from '../api'
 import dmsApi from '../api/dms'
 import { useAuthStore } from '../stores/auth'
+import { extLabel, formatSize } from './docs/helpers'
+import { relLabel } from './graph/constants'
 
 const route = useRoute()
 const router = useRouter()
@@ -179,24 +198,21 @@ const fullMarkdownLoading = ref(false)
 const images = ref([])
 const imagePreviewVisible = ref(false)
 const imagePreviewSrc = ref('')
-
-function previewImage(img) {
-  imagePreviewSrc.value = imageUrl(img)
-  imagePreviewVisible.value = true
-}
-
-const hasBacklinks = computed(() => (backlinks.value.incoming?.length || 0) + (backlinks.value.outgoing?.length || 0) > 0)
-
-function relLabel(t) {
-  const map = { similar: '相似', keyword: '关键词', reference: '引用', same_entity: '同实体' }
-  return map[t] || t
-}
-
-// 按章节（metadata.heading）分组，生成「章节标题 + 内容块」的可阅读结构
-const sectionedChunks = computed(() => {
+// 文件预览
+const previewVisible = ref(false)
+// 分页（章节视图 chunk 多时避免一次性渲染卡顿）
+const PAGE_SIZE = 50
+const chunkPage = ref(1)
+const totalChunks = computed(() => chunks.value.length)
+const totalPages = computed(() => Math.max(1, Math.ceil(totalChunks.value / PAGE_SIZE)))
+const pagedChunks = computed(() => {
+  const start = (chunkPage.value - 1) * PAGE_SIZE
+  return chunks.value.slice(start, start + PAGE_SIZE)
+})
+const pagedSectionedChunks = computed(() => {
   const sections = []
   let current = { heading: '', chunks: [] }
-  for (const c of chunks.value) {
+  for (const c of pagedChunks.value) {
     let heading = ''
     try {
       const meta = typeof c.metadata === 'string' ? JSON.parse(c.metadata) : (c.metadata || {})
@@ -211,6 +227,16 @@ const sectionedChunks = computed(() => {
   if (current.chunks.length) sections.push(current)
   return sections
 })
+const previewExt = computed(() => file.value?.ext || '')
+const canPreview = computed(() => ['docx', 'xlsx', 'xls', 'pdf'].includes(previewExt.value.toLowerCase().replace('.', '')))
+
+function previewImage(img) {
+  imagePreviewSrc.value = imageUrl(img)
+  imagePreviewVisible.value = true
+}
+
+const hasBacklinks = computed(() => (backlinks.value.incoming?.length || 0) + (backlinks.value.outgoing?.length || 0) > 0)
+
 
 // 清洗 chunk 内容：去除页眉页脚噪声（Page N / Confidential / 日期 / 重复标题），保留可读正文
 function cleanContent(text) {
@@ -280,24 +306,6 @@ function goToConversation(convId) {
   router.push({ path: '/', query: { conversation: convId } })
 }
 
-function iconFor(ext) {
-  const map = { '.pdf': '📄', '.ppt': '📊', '.pptx': '📊', '.xlsx': '📈', '.xls': '📈', '.docx': '📝', '.doc': '📝' }
-  return map[ext?.toLowerCase()] || '📋'
-}
-
-// 等宽扩展名徽标（与 DocumentsView 一致的工业精工风格）
-function extLabel(ext) {
-  const e = (ext || '').replace('.', '').toUpperCase()
-  const short = { PPTX: 'PPT', XLSX: 'XLS', XLS: 'XLS', DOCX: 'DOC', DOC: 'DOC' }
-  return short[e] || e || 'FILE'
-}
-
-function formatSize(bytes) {
-  if (!bytes) return '0 B'
-  if (bytes < 1024) return bytes + ' B'
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
-}
 
 // 管理操作：删除 / 改分类 / 改标签（补齐后端已实现但前端缺失的 U/D 链路）
 async function onAction(cmd) {
@@ -356,6 +364,22 @@ function openWithWps() {
     return
   }
   ElMessage.success('已唤起 WPS 打开：' + name)
+}
+
+// 下载原始文件（仅管理员）
+async function downloadFile() {
+  if (!file.value) return
+  try {
+    const resp = await api.get(`/documents/${file.value.id}/download`, { responseType: 'blob' })
+    const url = URL.createObjectURL(resp.data)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = file.value.name
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    ElMessage.error('下载失败: ' + (e.response?.data?.detail || e.message))
+  }
 }
 
 // 导出完整 Markdown（调用后端 /markdown 端点，下载 .md 文件）
@@ -435,6 +459,7 @@ async function loadFile() {
   loadError.value = ''
   file.value = null
   chunks.value = []
+  chunkPage.value = 1
   fullMarkdown.value = ''
   dmsRecord.value = null
   try {

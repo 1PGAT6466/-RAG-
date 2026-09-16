@@ -58,11 +58,26 @@ def process_file_rule(file_id: int) -> dict:
 
     用于入库流程的同步阶段，保证基础图谱立即可用；LLM 增强由 llm_worker 后台异步补。
     """
+    from concurrent.futures import ThreadPoolExecutor
     chunks = db.get_chunks_by_file(file_id)
     total = 0
-    for c in chunks:
-        entities = entity_extractor.extract_rule(c["content"])
-        _store_entities_and_edges(entities, c["id"], file_id)
+    # S19: 并行规则抽取（extract_rule 是纯 CPU 操作）
+    chunk_map = {c["id"]: c["content"] for c in chunks}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            cid: pool.submit(entity_extractor.extract_rule, content)
+            for cid, content in chunk_map.items()
+        }
+        results = {}
+        for cid, fut in futures.items():
+            try:
+                results[cid] = fut.result()
+            except Exception as e:
+                logger.warning(f"chunk {cid} 规则抽取异常: {e}")
+                results[cid] = []
+    # _store_entities_and_edges 仍串行（有 DB 写入）
+    for cid, entities in results.items():
+        _store_entities_and_edges(entities, cid, file_id)
         total += len(entities)
     # 文件级规格关联：同文件的 connector × param 建 spec 边（跨 chunk 关联，形成规格卡）
     _build_file_spec_edges(file_id)
@@ -159,7 +174,8 @@ def build_semantic_edges() -> dict:
     3. uses_standard：material → standard（同句共现驱动，精确到句中）
        例：不锈钢 → GB/T 1220（当两者在同一句中出现）
 
-    返回 {compatible_process, standard_category, uses_standard} 各边数
+    Returns:
+        {compatible_process, standard_category, uses_standard} 各边数
     """
     conn = db._get_conn()
     result = {"compatible_process": 0, "standard_category": 0, "uses_standard": 0}
@@ -275,7 +291,13 @@ def build_document_similarity_edges(top_k: int = 5, threshold: float = 0.7, file
     file_id 提供时：仅计算该文件与其余文件的相似度（增量，适用于入库后），
     避免每次全量 O(n²) 重算。file_id 为 None 时全量两两计算（首次/重建）。
 
-    返回新建边数量。
+    Args:
+        top_k: 每个文件最多保留的相似文件数（未使用，保留接口兼容）
+        threshold: 相似度阈值（默认 0.7）
+        file_id: 指定文件 ID（增量模式）
+
+    Returns:
+        新建边数量
     """
     conn = db._get_conn()
     files = conn.execute("SELECT id FROM files").fetchall()

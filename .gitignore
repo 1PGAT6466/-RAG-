@@ -32,3 +32,7 @@ frontend/.vite/
 Thumbs.db
 *.tmp
 watch_inbox/
+
+=== IDE ===
+.idea/
+*.iml

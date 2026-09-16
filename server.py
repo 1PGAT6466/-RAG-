@@ -183,6 +183,13 @@ async def request_logger(request: Request, call_next):
         "status_code": response.status_code,
         "elapsed_ms": round(elapsed_ms, 1),
     }
+    # P25: 记录请求指标
+    try:
+        from src.metrics import record_request
+        record_request(path=request.url.path, status=response.status_code, latency_ms=elapsed_ms)
+    except Exception:
+        pass
+
     if elapsed_ms > _SLOW_MS:
         logger.warning(
             f"[慢请求 {elapsed_ms:.0f}ms] {request.method} {request.url.path} "
@@ -243,9 +250,14 @@ if _FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
-        """SPA 回退：非 /api、/assets、/images 路径回退到 index.html"""
+        """SPA 回退：非 /api、/assets、/images 路径回退到 index.html。
+        已知静态文件（如 pdf-viewer.html）直接从 dist 提供，不走 SPA。"""
         if full_path.startswith("api/") or full_path.startswith("assets/") or full_path.startswith("images/"):
             raise StarletteHTTPException(status_code=404, detail="Not Found")
+        # 已知静态文件直接提供
+        static_file = _FRONTEND_DIST / full_path
+        if static_file.is_file() and full_path.endswith((".html", ".js", ".css", ".json", ".svg", ".ico")):
+            return FileResponse(static_file)
         index = _FRONTEND_DIST / "index.html"
         if index.exists():
             return FileResponse(index)
@@ -256,4 +268,4 @@ if __name__ == "__main__":
     import uvicorn
     logger.info(f"启动服务: http://{HOST}:{PORT}")
     # 直接传 app 对象（而非字符串 "server:app"），避免 Windows 下模块路径缓存导致加载旧代码
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    uvicorn.run("server:app", host=HOST, port=PORT, log_level="info", workers=1)

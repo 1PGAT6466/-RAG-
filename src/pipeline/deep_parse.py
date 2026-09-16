@@ -75,24 +75,28 @@ def _run_uni_pipe(UNIPipe, DiskReaderWriter, filepath: str) -> str:
     import os
 
     out_dir = tempfile.mkdtemp(prefix="mineru_")
-    local_image_dir = os.path.join(out_dir, "images")
-    os.makedirs(local_image_dir, exist_ok=True)
+    try:
+        local_image_dir = os.path.join(out_dir, "images")
+        os.makedirs(local_image_dir, exist_ok=True)
 
-    image_writer = DiskReaderWriter(local_image_dir)
-    # 常见构造：UNIPipe(pdf_bytes, jbig2_enc_type, image_writer)
-    # 先用标准方式，失败再尝试更简化的构造
-    with open(filepath, "rb") as f:
-        pdf_bytes = f.read()
+        image_writer = DiskReaderWriter(local_image_dir)
+        # 常见构造：UNIPipe(pdf_bytes, jbig2_enc_type, image_writer)
+        # 先用标准方式，失败再尝试更简化的构造
+        with open(filepath, "rb") as f:
+            pdf_bytes = f.read()
 
-    pipe = UNIPipe(pdf_bytes, "", image_writer)
-    pipe.pipe_classify()
-    pipe.pipe_analyze()
-    pipe.pipe_parse()
-    content = pipe.pipe_mk_markdown(local_image_dir, drop_mode="none")
-    # content 是 (md_text, md_content_list) 元组
-    if isinstance(content, tuple):
-        return content[0]
-    return str(content)
+        pipe = UNIPipe(pdf_bytes, "", image_writer)
+        pipe.pipe_classify()
+        pipe.pipe_analyze()
+        pipe.pipe_parse()
+        content = pipe.pipe_mk_markdown(local_image_dir, drop_mode="none")
+        # content 是 (md_text, md_content_list) 元组
+        if isinstance(content, tuple):
+            return content[0]
+        return str(content)
+    finally:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def _run_mineru_cli(filepath: str) -> str:

@@ -76,3 +76,24 @@ export function jobStatusClass(job) {
   if (job.status === 'failed') return 'status-failed'
   return 'status-running'
 }
+
+/**
+ * P3: 质量分标签类型（Element Plus tag type）
+ */
+export function qualityTagType(score) {
+  if (score < 0) return 'info'
+  if (score >= 80) return 'success'
+  if (score >= 60) return 'warning'
+  return 'danger'
+}
+
+/**
+ * P3: 质量分标签文字
+ */
+export function qualityLabel(score) {
+  if (score < 0) return '未评分'
+  if (score >= 80) return '优质'
+  if (score >= 60) return '良好'
+  if (score >= 40) return '一般'
+  return '低'
+}

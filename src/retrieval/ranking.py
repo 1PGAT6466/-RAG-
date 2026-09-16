@@ -85,18 +85,21 @@ def _query_terms(q_lower: str) -> list[str]:
     """把 query 拆成关键词。中文用 jieba，英文/数字用空格拆分。
     原实现用 str.split()，对无空格的中文查询返回整句导致关键词命中恒为 0。
     """
+    seen = set()
     terms = []
     # 英文/数字词（空格分隔）
     for t in q_lower.split():
-        if len(t) >= 2:
+        if len(t) >= 2 and t not in seen:
             terms.append(t)
+            seen.add(t)
     # 中文词（jieba），不足则整句兜底
     try:
         import jieba
         for w in jieba.lcut(q_lower):
             w = w.strip()
-            if len(w) >= 2 and w not in terms:
+            if len(w) >= 2 and w not in seen:
                 terms.append(w)
+                seen.add(w)
     except ImportError:
         pass
     if not terms and len(q_lower) >= 2:
@@ -105,7 +108,11 @@ def _query_terms(q_lower: str) -> list[str]:
 
 
 def exact_match_boost(query: str, results: list) -> list:
-    """精确匹配 + 型号/编号加权"""
+    """[已废弃] 原用于精确匹配加法，已被 _recover_exact_match（置顶保序）替代。
+    保留供历史兼容，勿在新代码中使用。
+
+    精确匹配 + 型号/编号加权
+    """
     if not results:
         return results
     q_lower = query.lower()
@@ -200,7 +207,7 @@ def dynamic_category_weight(query: str, results: list) -> list:
     return results
 
 
-def weighted_rrf_fusion(bm25: list, vec: list, query: str, top_k: int, k: int = 60,
+def weighted_rrf_fusion(bm25: list, vec: list, query: str, top_k: int, k: int = None,
                         graph: list = None, filename: list = None) -> list:
     """动态 α 加权的 RRF 融合（替代原硬编码 BM25_WEIGHT/VECTOR_WEIGHT）
 
@@ -210,6 +217,9 @@ def weighted_rrf_fusion(bm25: list, vec: list, query: str, top_k: int, k: int = 
               max(v_w, b_w)——至少不弱于最强词面/向量源，确保文件名命中的目标文档
               能挤进候选池，不被大文档词频碾压。
     """
+    if k is None:
+        from config import RRF_K
+        k = RRF_K
     v_w, b_w = get_dynamic_alpha(query)
     g_w = v_w  # 图谱导航与向量语义同级权重
     f_w = max(v_w, b_w)  # 文件名命中 = 强信号，权重不低于最强检索源

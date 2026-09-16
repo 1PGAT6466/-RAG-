@@ -26,9 +26,15 @@ SEMANTIC_CACHE_VERSION = 2
 _cache_lock = threading.Lock()
 _entries: list[dict] = []  # [{query, embedding: np.ndarray, answer, sources, ts, version}]
 
+# S13: _ensure_table 只需执行一次，后续调用直接跳过
+_table_ensured = False
+
 
 def _ensure_table():
     """确保 SQLite 表存在（含 version 列，兼容旧表）"""
+    global _table_ensured
+    if _table_ensured:
+        return
     try:
         from src.storage.db import _get_conn
         conn = _get_conn()
@@ -44,11 +50,14 @@ def _ensure_table():
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
             )
         """)
+        # S14: 为 query 列创建索引，加速 hit_count UPDATE 语句
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_semantic_cache_query ON semantic_cache(query)")
         # 旧表无 version 列则补上（幂等）
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(semantic_cache)").fetchall()]
         if "version" not in cols:
             conn.execute("ALTER TABLE semantic_cache ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
         conn.commit()
+        _table_ensured = True
     except Exception as e:
         logger.warning(f"语义缓存表创建失败: {e}")
 
@@ -72,7 +81,13 @@ def _embedding_dim_of(data: bytes) -> int:
 
 
 def load_cache():
-    """启动时从 SQLite 加载缓存到内存"""
+    """启动时从 SQLite 加载缓存到内存
+
+    加载逻辑：
+    1. 版本不一致的旧缓存整条跳过（失效，不加载进内存）
+    2. 向量归一化后存储到内存
+    3. 按 hit_count 降序排列，优先加载高命中缓存
+    """
     global _entries
     if not _use_cache():
         return
@@ -162,7 +177,7 @@ def _sources_still_valid(sources: list) -> bool:
     """校验缓存来源（chunk_id/file_id）是否仍存在，全部有效返回 True。
 
     无来源（空列表/None）视为有效（闲聊式裸答案无锚点，不因无 sources 而误判失效）。
-    来源非空时，对每个 source 做轻量存在性检查（chunk_id 优先，回退 file_id），
+    来源非空时，批量查询 chunks/files 表确认存在性，
     任一来源指向已删数据则返回 False（缓存整体失效，走正常检索）。
     纯读、单次批量查询、异常降级 True（宁可放过也不因 DB 异常阻断缓存命中）。
     """
@@ -171,17 +186,20 @@ def _sources_still_valid(sources: list) -> bool:
     try:
         from src.storage.db import _get_conn
         conn = _get_conn()
-        for s in sources:
-            cid = s.get("chunk_id")
-            fid = s.get("file_id")
-            if cid:
-                row = conn.execute("SELECT 1 FROM chunks WHERE id = ?", (cid,)).fetchone()
-                if not row:
-                    return False
-            elif fid:
-                row = conn.execute("SELECT 1 FROM files WHERE id = ?", (fid,)).fetchone()
-                if not row:
-                    return False
+        chunk_ids = [s["chunk_id"] for s in sources if s.get("chunk_id")]
+        file_ids = [s["file_id"] for s in sources if s.get("file_id") and not s.get("chunk_id")]
+        if chunk_ids:
+            placeholders = ",".join("?" * len(chunk_ids))
+            rows = conn.execute(f"SELECT id FROM chunks WHERE id IN ({placeholders})", chunk_ids).fetchall()
+            found = {r["id"] for r in rows}
+            if not all(cid in found for cid in chunk_ids):
+                return False
+        if file_ids:
+            placeholders = ",".join("?" * len(file_ids))
+            rows = conn.execute(f"SELECT id FROM files WHERE id IN ({placeholders})", file_ids).fetchall()
+            found = {r["id"] for r in rows}
+            if not all(fid in found for fid in file_ids):
+                return False
         return True
     except Exception as e:
         logger.debug(f"缓存来源有效性校验异常（降级放行）: {e}")
@@ -209,12 +227,11 @@ def store(query: str, query_embedding: bytes, answer: str, sources: list):
     }
 
     with _cache_lock:
-        _entries.append(entry)
-        # LRU 淘汰
-        if len(_entries) > SEMANTIC_CACHE_MAX:
+        # LRU 淘汰（先预留空间，避免内存写入后 SQLite 失败导致不一致）
+        if len(_entries) >= SEMANTIC_CACHE_MAX:
             _entries.pop(0)
 
-    # 持久化到 SQLite
+    # 持久化到 SQLite（先于内存写入，保证一致性）
     try:
         _ensure_table()
         from src.storage.db import _get_conn
@@ -226,6 +243,11 @@ def store(query: str, query_embedding: bytes, answer: str, sources: list):
         conn.commit()
     except Exception as e:
         logger.debug(f"缓存持久化失败: {e}")
+        return
+
+    # SQLite 持久化成功后才写入内存
+    with _cache_lock:
+        _entries.append(entry)
 
 
 def _update_hit_count(query: str):

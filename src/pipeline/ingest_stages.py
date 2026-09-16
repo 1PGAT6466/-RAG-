@@ -1,4 +1,4 @@
-"""
+﻿"""
 ingest_stages.py — 引擎内置 Stage 实现
 
 把入库流水线拆成可独立降级的 Stage，注册进 engine。
@@ -32,6 +32,7 @@ logger = logging.getLogger("rag.engine.stages")
 @engine.register_stage("parse", stage_type="sync")
 def _stage_parse(ctx: dict):
     from .parser import parse_file
+    from .quality import compute_quality_score
     ext = ctx["ext"]
     target = ctx["target_path"]
     # 统一走 parse_file：内部对 PDF 做乱码/扫描件检测→OCR，与流式路径一致
@@ -39,6 +40,8 @@ def _stage_parse(ctx: dict):
     if not text or len(text.strip()) < 50:
         raise ValueError("文档无有效内容")
     ctx["text"] = text
+    # P3: 解析后计算质量分
+    ctx["quality_score"] = compute_quality_score(text)
 
 
 @engine.register_stage("chunk", stage_type="sync")
@@ -77,9 +80,19 @@ def _stage_store(ctx: dict):
         name=ctx["filename"], path=ctx["target_path"], ext=ctx["ext"],
         size=os.path.getsize(ctx["target_path"])
     )
+    # P3: 写入质量分
+    quality_score = ctx.get("quality_score", -1)
+    if quality_score >= 0:
+        try:
+            from src.storage.db import _get_conn
+            _get_conn().execute("UPDATE files SET quality_score=? WHERE id=?", (quality_score, file_id))
+            _get_conn().commit()
+        except Exception as e:
+            logger.warning(f"质量分写入失败（已忽略）: {e}")
     batch = [
         (file_id, c["index"], c["content"], ctx["token_counts"][i], ctx["embeddings"][i],
-         {"heading": c["heading"], "source": c["source"], "markdown": bool(c.get("markdown"))})
+         {"heading": c["heading"], "source": c["source"], "markdown": bool(c.get("markdown")),
+                     "section_id": c.get("section_id"), "section_text": (c.get("section_text") or "")[:1000]})
         for i, c in enumerate(chunks)
     ]
     chunk_ids = add_chunks_batch(batch)
@@ -150,7 +163,7 @@ def _stage_extract(ctx: dict):
 # ============================================================
 def _llm_chat(text: str, system: str, max_tokens: int = 1024, prefer_deepseek: bool = False) -> str:
     """同步 LLM 调用（供后台线程用），委托 src.llm。"""
-    from src.llm import call_llm_sync
+    from src.llm_client import call_llm_sync
     messages = [{"role": "system", "content": system}, {"role": "user", "content": text}]
     return call_llm_sync(messages, max_tokens=max_tokens, prefer_mimo=not prefer_deepseek)
 
@@ -184,7 +197,7 @@ def _stage_summarize(ctx: dict):
         import json
         summary, tags = '', []
         try:
-            from src.llm import extract_json
+            from src.llm_client import extract_json
             data = extract_json(raw, expect="object") or {}
             summary = (data.get("summary") or "").strip()
             tags = [t for t in (data.get("tags") or []) if isinstance(t, str)][:8]
@@ -344,3 +357,44 @@ def _stage_images(ctx: dict):
             logger.info(f"文件 {file_id} 图片提取完成: {n} 张")
     except Exception as e:
         logger.warning(f"图片提取失败（已忽略）: {e}")
+
+
+@engine.register_stage("compile_wiki", stage_type="async")
+def _stage_compile_wiki(ctx: dict):
+    """Wiki 编译：高价值文档自动编译为结构化知识页（M2）
+
+    非 critical，失败降级跳过。
+    """
+    try:
+        from .wiki_compiler import compile_page, save_compiled_page
+        file_id = ctx.get("file_id")
+        if not file_id:
+            return
+        # 幂等：已有该文件的 Wiki 页面则跳过
+        # S7: 改用精确匹配，避免 LIKE '%id%' 误匹配（如 id=1 匹配 id=10, 11, 100 等）
+        from src.storage.db import _get_conn
+        conn = _get_conn()
+        import json as _json
+        existing = None
+        all_pages = conn.execute(
+            "SELECT id, source_file_ids FROM wiki_pages"
+        ).fetchall()
+        for page_row in all_pages:
+            raw_ids = page_row["source_file_ids"] if hasattr(page_row, "keys") else page_row[1]
+            try:
+                ids_list = _json.loads(raw_ids) if raw_ids else []
+            except (TypeError, _json.JSONDecodeError):
+                ids_list = []
+            if int(file_id) in [int(x) for x in ids_list]:
+                existing = page_row
+                break
+        if existing:
+            logger.info(f"文件 {file_id} 已有 Wiki 页面，跳过编译")
+            return
+        result = compile_page(file_id)
+        if result:
+            page_id = save_compiled_page(result)
+            if page_id:
+                logger.info(f"Wiki 页面已创建: page_id={page_id} <- file_id={file_id}")
+    except Exception as e:
+        logger.warning(f"Wiki 编译失败（已忽略）: {e}")

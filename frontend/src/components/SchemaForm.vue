@@ -71,7 +71,11 @@ initModel()
 
 watch(() => props.modelValue, initModel)
 
-watch(model, (v) => emit('update:modelValue', { ...v }), { deep: true })
+let skipNext = false
+watch(model, (v) => {
+  if (skipNext) { skipNext = false; return }
+  emit('update:modelValue', { ...v })
+}, { deep: true })
 
 const orderedKeys = computed(() => {
   const order = props.schema?.['ui:order'] || []

@@ -21,6 +21,28 @@ import logging
 logger = logging.getLogger("rag.parser.backend")
 
 
+# S18: LibreOffice 路径发现 — 公共函数，消除 _parse_ppt / _parse_xls 重复代码
+def find_libreoffice() -> str | None:
+    """查找 LibreOffice soffice 可执行文件路径，返回路径或 None。"""
+    import os
+    import subprocess
+    candidates = [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "soffice",
+        "libreoffice",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+        try:
+            if subprocess.run(["where", p], capture_output=True).returncode == 0:
+                return p
+        except Exception:
+            pass
+    return None
+
+
 class ParseBackend:
     """解析后端统一接口。子类实现 parse，失败抛 ValueError（由调用方显式标记失败）。"""
 
@@ -79,9 +101,10 @@ class OfficeBackend(ParseBackend):
 
 
 class TextBackend(ParseBackend):
-    """纯文本（txt/md/log）+ CSV + 未知扩展名（二进制 null 嗅探后兜底）。"""
+    """纯文本（txt/md/log）+ CSV + JSON + XML + 未知扩展名（二进制 null 嗅探后兜底）。"""
 
     _CSV = (".csv",)
+    _STRUCTURED = (".json", ".xml", ".svg", ".yaml", ".yml", ".toml", ".ini", ".cfg")
 
     def parse(self, filepath: str) -> str:
         from pathlib import Path
@@ -89,9 +112,32 @@ class TextBackend(ParseBackend):
         ext = Path(filepath).suffix.lower()
         if ext in self._CSV:
             return _p._parse_csv(filepath)
+        if ext in self._STRUCTURED:
+            return _p._parse_txt(filepath)
         # 未知/文本扩展名：二进制嗅探（null 占比过高则拒绝），否则走多编码文本读取
         _sniff_reject_binary(filepath, ext)
         return _p._parse_txt(filepath)
+
+
+class EpubBackend(ParseBackend):
+    """EPUB 电子书解析（技术手册常见格式）。"""
+
+    def parse(self, filepath: str) -> str:
+        return _parse_epub(filepath)
+
+
+class HtmlBackend(ParseBackend):
+    """HTML 页面解析。"""
+
+    def parse(self, filepath: str) -> str:
+        return _parse_html(filepath)
+
+
+class ImageBackend(ParseBackend):
+    """图片 OCR 解析（PNG/JPG/BMP/TIFF）。"""
+
+    def parse(self, filepath: str) -> str:
+        return _parse_image_ocr(filepath)
 
 
 def _sniff_reject_binary(filepath: str, ext: str):
@@ -123,6 +169,13 @@ EXT_BACKEND = {
     # Office
     ".docx": OfficeBackend, ".xlsx": OfficeBackend, ".xls": OfficeBackend,
     ".ppt": OfficeBackend, ".pptx": OfficeBackend,
+    # EPUB
+    ".epub": EpubBackend,
+    # HTML
+    ".html": HtmlBackend, ".htm": HtmlBackend,
+    # 图片 OCR
+    ".png": ImageBackend, ".jpg": ImageBackend, ".jpeg": ImageBackend,
+    ".bmp": ImageBackend, ".tiff": ImageBackend, ".tif": ImageBackend,
 }
 
 # 默认后端（文本/未知扩展名）
@@ -132,3 +185,109 @@ DEFAULT_BACKEND = TextBackend
 def get_backend(ext: str):
     """按扩展名返回 backend 类（无匹配则返回默认 TextBackend）。"""
     return EXT_BACKEND.get(ext, DEFAULT_BACKEND)
+
+
+# === 新增格式解析函数 ===
+
+def _parse_epub(filepath: str) -> str:
+    """EPUB 电子书解析：提取所有章节文本。"""
+    try:
+        import ebooklib
+        from ebooklib import epub
+        from html.parser import HTMLParser
+    except ImportError:
+        raise ValueError("ebooklib 未安装，无法解析 EPUB")
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self._text = []
+            self._skip = False
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "nav"):
+                self._skip = True
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "nav"):
+                self._skip = False
+        def handle_data(self, data):
+            if not self._skip:
+                t = data.strip()
+                if t:
+                    self._text.append(t)
+        def get_text(self):
+            return "\n".join(self._text)
+
+    book = epub.read_epub(filepath, options={"ignore_ncx": True})
+    parts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        html = item.get_content().decode("utf-8", errors="replace")
+        extractor = _TextExtractor()
+        extractor.feed(html)
+        text = extractor.get_text()
+        if text and len(text) > 10:
+            parts.append(text)
+    result = "\n\n".join(parts)
+    if len(result.strip()) < 50:
+        raise ValueError(f"EPUB 解析内容过少: {len(result)} 字")
+    return result
+
+
+def _parse_html(filepath: str) -> str:
+    """HTML 页面解析：提取正文文本。"""
+    from html.parser import HTMLParser
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self._text = []
+            self._skip = False
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style", "head"):
+                self._skip = True
+        def handle_endtag(self, tag):
+            if tag in ("script", "style", "head"):
+                self._skip = False
+        def handle_data(self, data):
+            if not self._skip:
+                t = data.strip()
+                if t:
+                    self._text.append(t)
+        def get_text(self):
+            return "\n".join(self._text)
+
+    # 尝试多种编码
+    for enc in ("utf-8", "gb18030", "latin-1"):
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                html = f.read()
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    else:
+        raise ValueError(f"HTML 文件无法解码: {filepath}")
+
+    extractor = _TextExtractor()
+    extractor.feed(html)
+    result = extractor.get_text()
+    if len(result.strip()) < 20:
+        raise ValueError(f"HTML 解析内容过少: {len(result)} 字")
+    return result
+
+
+def _parse_image_ocr(filepath: str) -> str:
+    """图片 OCR 解析：使用 RapidOCR 提取文字。"""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        raise ValueError("RapidOCR 未安装，无法解析图片")
+
+    ocr = RapidOCR()
+    result, _ = ocr(filepath)
+    if not result:
+        raise ValueError(f"图片 OCR 未识别到文字: {filepath}")
+    # result 格式: [[box, text, score], ...]
+    texts = [item[1] for item in result if item[2] > 0.5]
+    text = "\n".join(texts)
+    if len(text.strip()) < 10:
+        raise ValueError(f"OCR 结果过少: {len(text)} 字")
+    return text

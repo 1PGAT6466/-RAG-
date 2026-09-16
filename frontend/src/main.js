@@ -2,7 +2,7 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import {
   Aim, Back, ChatDotRound, CircleClose, Connection, Delete, Document, Download,
-  Folder, Grid, Loading, Lock, MagicStick, MoreFilled, Plus, Promotion, Refresh,
+  Folder, FolderOpened, Grid, List, Loading, Lock, MagicStick, MoreFilled, Plus, Promotion, Refresh,
   Search, Setting, Share, Shop, SwitchButton, TopRight, Upload, User,
 } from '@element-plus/icons-vue'
 import App from './App.vue'
@@ -20,7 +20,7 @@ app.use(router)
 // 按需注册全局图标（全站实际用到 22 个，替代原先的全量 250+ 注册）
 const icons = {
   Aim, Back, ChatDotRound, CircleClose, Connection, Delete, Document, Download,
-  Folder, Grid, Loading, Lock, MagicStick, MoreFilled, Plus, Promotion, Refresh,
+  Folder, FolderOpened, Grid, List, Loading, Lock, MagicStick, MoreFilled, Plus, Promotion, Refresh,
   Search, Setting, Share, Shop, SwitchButton, TopRight, Upload, User,
 }
 for (const [key, component] of Object.entries(icons)) {

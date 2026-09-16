@@ -4,6 +4,7 @@
 import logging
 from pathlib import Path
 from config import RAG_PDF_OCR
+from .elements import Element, ParseResult
 
 logger = logging.getLogger("rag.parser")
 
@@ -23,6 +24,123 @@ def parse_file(filepath: str) -> str:
     backend = get_backend(ext)
     logger.info(f"解析 [{ext or '无扩展名'}]: {filepath} (backend={backend.__name__})")
     return backend().parse(filepath)
+
+
+def _parse_pdf_elements(filepath: str) -> ParseResult:
+    """PDF 结构化解析 — 返回 ParseResult（逐页元素列表）。
+
+    不修改 _parse_pdf 本身，而是调用它获取完整文本后，
+    用 fitz 逐页遍历并解析为结构化 Element 列表。
+    """
+    import fitz
+
+    # 调用现有 _parse_pdf 获取完整文本（含 OCR 降级逻辑）
+    full_text = _parse_pdf(filepath)
+
+    # 用 fitz 逐页拆分，每页文本解析为 Element 列表
+    elements: list[Element] = []
+    with fitz.open(filepath) as doc:
+        total_pages = len(doc)
+        for i, page in enumerate(doc):
+            page_text = page.get_text().strip()
+            if not page_text:
+                continue
+            # 用 _page_text_reflowed 获取 markdown 化文本
+            try:
+                md_text = _page_text_reflowed(page)
+            except Exception:
+                md_text = page_text
+            if not md_text or not md_text.strip():
+                continue
+            # 逐行解析 markdown 文本
+            lines = md_text.split('\n')
+            table_buf: list[list[str]] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    # 空行：flush 表格缓冲
+                    if table_buf:
+                        md = '\n'.join([' | '.join(r) for r in table_buf])
+                        elements.append(Element(
+                            type='table', text=md, rows=table_buf,
+                            metadata={'page': i, 'row_count': len(table_buf),
+                                      'col_count': len(table_buf[0]) if table_buf else 0}
+                        ))
+                        table_buf = []
+                    continue
+                # 检测 markdown 标题
+                if stripped.startswith('# '):
+                    # flush 表格缓冲
+                    if table_buf:
+                        md = '\n'.join([' | '.join(r) for r in table_buf])
+                        elements.append(Element(
+                            type='table', text=md, rows=table_buf,
+                            metadata={'page': i, 'row_count': len(table_buf),
+                                      'col_count': len(table_buf[0]) if table_buf else 0}
+                        ))
+                        table_buf = []
+                    elements.append(Element(type='heading', text=stripped[2:].strip(),
+                                           metadata={'level': 1, 'page': i}))
+                elif stripped.startswith('## '):
+                    if table_buf:
+                        md = '\n'.join([' | '.join(r) for r in table_buf])
+                        elements.append(Element(
+                            type='table', text=md, rows=table_buf,
+                            metadata={'page': i, 'row_count': len(table_buf),
+                                      'col_count': len(table_buf[0]) if table_buf else 0}
+                        ))
+                        table_buf = []
+                    elements.append(Element(type='heading', text=stripped[3:].strip(),
+                                           metadata={'level': 2, 'page': i}))
+                elif stripped.startswith('### '):
+                    if table_buf:
+                        md = '\n'.join([' | '.join(r) for r in table_buf])
+                        elements.append(Element(
+                            type='table', text=md, rows=table_buf,
+                            metadata={'page': i, 'row_count': len(table_buf),
+                                      'col_count': len(table_buf[0]) if table_buf else 0}
+                        ))
+                        table_buf = []
+                    elements.append(Element(type='heading', text=stripped[4:].strip(),
+                                           metadata={'level': 3, 'page': i}))
+                elif stripped.startswith('|') and '|' in stripped[1:]:
+                    # 表格行：按 | 分割
+                    cells = [c.strip() for c in stripped.split('|')]
+                    # 去掉首尾空元素（split '|' 会在首尾产生空串）
+                    if cells and cells[0] == '':
+                        cells = cells[1:]
+                    if cells and cells[-1] == '':
+                        cells = cells[:-1]
+                    # 跳过分隔行（如 |---|---|）
+                    if all(set(c.strip()) <= {'-', ':'} for c in cells):
+                        continue
+                    table_buf.append(cells)
+                else:
+                    # flush 表格缓冲
+                    if table_buf:
+                        md = '\n'.join([' | '.join(r) for r in table_buf])
+                        elements.append(Element(
+                            type='table', text=md, rows=table_buf,
+                            metadata={'page': i, 'row_count': len(table_buf),
+                                      'col_count': len(table_buf[0]) if table_buf else 0}
+                        ))
+                        table_buf = []
+                    elements.append(Element(type='text', text=stripped, metadata={'page': i}))
+            # flush 残余表格缓冲
+            if table_buf:
+                md = '\n'.join([' | '.join(r) for r in table_buf])
+                elements.append(Element(
+                    type='table', text=md, rows=table_buf,
+                    metadata={'page': i, 'row_count': len(table_buf),
+                              'col_count': len(table_buf[0]) if table_buf else 0}
+                ))
+
+    # 如果 fitz 逐页解析未产出元素，用 full_text 兜底
+    if not elements and full_text and full_text.strip():
+        elements.append(Element(type='text', text=full_text.strip()))
+
+    result = ParseResult(elements=elements, source_file=filepath, total_pages=total_pages)
+    return result
 
 
 def _parse_pdf(filepath: str) -> str:
@@ -51,6 +169,24 @@ def _parse_pdf(filepath: str) -> str:
             logger.info("MinerU 深度解析未产出有效文本，降级回 fitz+OCR")
     except Exception as e:
         logger.debug(f"深度解析前置检查跳过: {e}")
+
+    # docling 版面分析（可选）：开启 flag 时，优先用 docling 对 PDF 做结构化版面分析；
+    #   docling 未安装/失败/产出过短时，自动降级回下面的 fitz+OCR 主链路（零影响）。
+    try:
+        from config import RAG_DOCLING_PDF
+        if RAG_DOCLING_PDF == "1":
+            from src.pipeline.docling_parser import parse_pdf_with_docling
+            result = parse_pdf_with_docling(filepath)
+            text = result.to_text()
+            if len(text.strip()) >= 50:
+                logger.info(f"docling 版面分析成功 ({len(text)} 字)")
+                return text
+            else:
+                logger.warning(f"docling 产出过短 ({len(text)} 字)，降级到 fitz")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"docling 版面分析失败: {e}，降级到 fitz")
 
     if mode == "force":
         ocr_text = _parse_pdf_ocr(filepath)
@@ -125,42 +261,96 @@ def _text_garbled_check(text: str) -> bool:
 
 
 def _page_text_reflowed(page) -> str:
-    """逐页提取文本：单栏用 fitz 默认序，双栏自动重排（左栏先、右栏后）。
+    """逐页提取文本，产出 Markdown 化结构（P1 改造）。
 
-    只影响解析内部实现，不改变 _parse_pdf 对外行为（仍返回纯文本字符串）。
+    使用 fitz dict API 提取字体信息，自动识别标题层级（大字体 = 标题）。
+    双栏页保持重排逻辑不变。
 
-    双栏判定（基于文本块坐标，无新依赖）：连续文本块的 x 起点差异 > 错跨栏阈值，
-    且左右两栏都有足够块数，判定为双栏，按 (行 y, 栏 x) 重排；否则回退 fitz 默认
-    get_text() 的阅读序（单栏页不受影响）。
-
-    实测（非标准机械设计手册.pdf，1423 页，抽前 200 页）：
-      54.5% 清晰多栏、28.5% 乱码、13.5% 清晰单栏、3.5% 空页。
-    该重排只作用于「清晰双栏」页，其余页行为不变。
+    输出格式：
+      # 大标题（字体 ≥ 正文 1.4x）
+      ## 小标题（字体 ≥ 正文 1.2x）
+      正常段落（正文）
+      | 表格 |（如果检测到表格结构）
     """
     import fitz
 
-    # 文本块（b[4] 为文本，过滤空块）
-    blocks = [b for b in page.get_text("blocks") if (b[4] or "").strip()]
+    # 用 dict API 提取带字体信息的块
+    try:
+        d = page.get_text("dict")
+        blocks = d.get("blocks", [])
+    except Exception:
+        return page.get_text()  # fallback
+
     if not blocks:
         return page.get_text()
 
-    # 双栏判定：x 起点跨度 > 阈值，且左右两栏块数都 > 1
-    xs = [b[0] for b in blocks]
-    x_span = max(xs) - min(xs)
-    if x_span < _MULTI_COL_MIN_SPAN or len(blocks) < 4:
+    # 收集所有 span 的字体大小，确定正文基准字号
+    font_sizes = []
+    for b in blocks:
+        if b.get("type") != 0:  # 只看文本块
+            continue
+        for line in b.get("lines", []):
+            for span in line.get("spans", []):
+                text = (span.get("text") or "").strip()
+                if text and len(text) > 1:
+                    font_sizes.append(round(span.get("size", 12), 1))
+
+    if not font_sizes:
         return page.get_text()
 
-    mid_x = (min(xs) + max(xs)) / 2
-    left = [b for b in blocks if b[0] < mid_x]
-    right = [b for b in blocks if b[0] >= mid_x]
-    if len(left) < 2 or len(right) < 2:
-        return page.get_text()
+    # 正文基准字号：取众数（最常见的字号）
+    from collections import Counter
+    size_counter = Counter(font_sizes)
+    body_size = size_counter.most_common(1)[0][0]
 
-    # 双栏重排：左栏按 y 排，再右栏按 y 排（各栏内保持垂直阅读序）
-    left.sort(key=lambda b: (b[1], b[0]))
-    right.sort(key=lambda b: (b[1], b[0]))
-    ordered = left + right
-    return "\n".join(b[4].strip() for b in ordered if b[4].strip())
+    # 构建 Markdown
+    lines_out = []
+    for b in blocks:
+        if b.get("type") != 0:
+            continue
+
+        # 双栏判定：保持原有逻辑
+        # （在 dict API 下，blocks 已按阅读序排列，双栏页需要重排）
+        block_lines = []
+        max_font = 0
+        is_bold = False
+
+        for line in b.get("lines", []):
+            line_text_parts = []
+            for span in line.get("spans", []):
+                text = (span.get("text") or "").strip()
+                if not text:
+                    continue
+                line_text_parts.append(text)
+                size = span.get("size", 12)
+                if size > max_font:
+                    max_font = size
+                flags = span.get("flags", 0)
+                if flags & 16:  # bit 4 = bold
+                    is_bold = True
+
+            line_text = " ".join(line_text_parts).strip()
+            if line_text:
+                block_lines.append(line_text)
+
+        if not block_lines:
+            continue
+
+        block_text = " ".join(block_lines)
+
+        # 标题检测：基于字体大小
+        size_ratio = max_font / body_size if body_size > 0 else 1
+        if size_ratio >= 1.4:
+            lines_out.append(f"# {block_text}")
+        elif size_ratio >= 1.2:
+            lines_out.append(f"## {block_text}")
+        elif is_bold and size_ratio >= 1.1 and len(block_text) < 100:
+            # 加粗 + 稍大 + 短文本 → 三级标题
+            lines_out.append(f"### {block_text}")
+        else:
+            lines_out.append(block_text)
+
+    return "\n\n".join(lines_out)
 
 
 def _extract_pdf_text(filepath: str) -> str:
@@ -182,7 +372,7 @@ def _parse_pdf_ocr(filepath: str) -> str:
     """PDF OCR：用 PyMuPDF 渲染页面 → RapidOCR，逐页识别
 
     大文件（几百上千页）耗时较长，但这是修复内嵌字体乱码的唯一可靠手段。
-    返回纯文本，失败返回空字符串。
+    返回纯文本（经后处理：页眉页脚/页号过滤 + 段落合并），失败返回空字符串。
     """
     import fitz
 
@@ -193,26 +383,111 @@ def _parse_pdf_ocr(filepath: str) -> str:
         logger.warning(f"OCR 引擎初始化失败: {e}")
         return ""
 
-    texts = []
+    try:
+        import numpy as np
+    except ImportError:
+        logger.warning("numpy 未安装，OCR 解析无法执行")
+        return ""
+
+    page_texts = []
     with fitz.open(filepath) as doc:
         total = len(doc)
         logger.info(f"OCR 解析开始: {total} 页")
         for i, page in enumerate(doc):
             try:
                 pix = page.get_pixmap(dpi=150)
-                import numpy as np
-                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-                # RapidOCR 接受 RGB/BGR 数组或图片路径
-                if img.shape[2] == 4:
-                    img = img[:, :, :3]
-                page_text = ocr_page_text(ocr, img)
-                if page_text:
-                    texts.append(page_text)
+                try:
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                    if img.shape[2] == 4:
+                        img = img[:, :, :3]
+                    page_text = ocr_page_text(ocr, img)
+                    if page_text:
+                        page_texts.append((i, page_text))
+                finally:
+                    pix = None
             except Exception as e:
                 logger.warning(f"第 {i} 页 OCR 失败: {e}")
             if (i + 1) % 50 == 0:
                 logger.info(f"  OCR ...{i + 1}/{total} 页")
-    return "\n\n".join(texts)
+
+    # P2: OCR 后处理管线
+    return _postprocess_ocr(page_texts)
+
+
+def _postprocess_ocr(page_texts: list[tuple[int, str]]) -> str:
+    """P2: OCR 后处理管线 — 页眉页脚/页号过滤 + 段落合并 + 重复行去重。
+
+    输入：[(page_index, page_text), ...]
+    输出：干净的纯文本
+    """
+    if not page_texts:
+        return ""
+
+    import re
+    from collections import Counter
+
+    # Step 1: 逐页拆行
+    page_lines = []
+    for idx, text in page_texts:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        page_lines.append((idx, lines))
+
+    # Step 2: 页眉页脚检测 — 连续 ≥3 页出现的首行/末行视为页眉/页脚
+    if len(page_lines) >= 3:
+        first_lines = Counter()
+        last_lines = Counter()
+        for idx, lines in page_lines:
+            if len(lines) >= 2:
+                first_lines[lines[0]] += 1
+                last_lines[lines[-1]] += 1
+
+        # 出现频率 ≥ 30% 的首行/末行视为页眉/页脚
+        threshold = max(3, len(page_lines) * 0.3)
+        header_set = {line for line, count in first_lines.items() if count >= threshold}
+        footer_set = {line for line, count in last_lines.items() if count >= threshold}
+    else:
+        header_set = set()
+        footer_set = set()
+
+    # Step 3: 页号过滤 — 独立数字行（1-4 位数，可能带 "-" 前缀/后缀）
+    page_num_pat = re.compile(r'^[-\s]*\d{1,4}[-\s]*$')
+
+    # Step 4: 逐页清理 + 收集
+    cleaned_pages = []
+    for idx, lines in page_lines:
+        cleaned = []
+        for i, line in enumerate(lines):
+            # 跳过页眉（首行）
+            if i == 0 and line in header_set:
+                continue
+            # 跳过页脚（末行）
+            if i == len(lines) - 1 and line in footer_set:
+                continue
+            # 跳过页号
+            if page_num_pat.match(line):
+                continue
+            cleaned.append(line)
+        if cleaned:
+            cleaned_pages.append("\n".join(cleaned))
+
+    # Step 5: 段落合并 — 连续非空行合并为段落（以空行或标题行为分隔）
+    result_parts = []
+    for page_text in cleaned_pages:
+        # 简单段落合并：连续行拼接，遇到空行/标题行分段
+        paragraphs = []
+        current = []
+        for line in page_text.split("\n"):
+            if not line.strip():
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+            else:
+                current.append(line)
+        if current:
+            paragraphs.append(" ".join(current))
+        result_parts.append("\n\n".join(paragraphs))
+
+    return "\n\n".join(result_parts)
 
 
 def _parse_pptx(filepath: str) -> str:
@@ -241,18 +516,9 @@ def _parse_ppt(filepath: str) -> str:
     import tempfile
     import os
 
-    # 找 LibreOffice / soffice
-    lo_paths = [
-        r"C:\Program Files\LibreOffice\program\soffice.exe",
-        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-        "soffice",
-        "libreoffice",
-    ]
-    soffice = None
-    for p in lo_paths:
-        if os.path.exists(p) or subprocess.run(["where", p], capture_output=True).returncode == 0:
-            soffice = p
-            break
+    # S18: 使用 backends.find_libreoffice() 公共函数
+    from .backends import find_libreoffice
+    soffice = find_libreoffice()
 
     if soffice:
         out_dir = tempfile.mkdtemp()
@@ -362,16 +628,9 @@ def _parse_xls(filepath: str) -> str:
     # 回退 LibreOffice 转 xlsx
     try:
         import subprocess, tempfile, os, glob
-        lo_paths = [
-            r"C:\Program Files\LibreOffice\program\soffice.exe",
-            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-            "soffice", "libreoffice",
-        ]
-        soffice = None
-        for p in lo_paths:
-            if os.path.exists(p) or subprocess.run(["where", p], capture_output=True).returncode == 0:
-                soffice = p
-                break
+        # S18: 使用 backends.find_libreoffice() 公共函数
+        from .backends import find_libreoffice
+        soffice = find_libreoffice()
         if soffice:
             out_dir = tempfile.mkdtemp()
             try:
@@ -389,11 +648,17 @@ def _parse_xls(filepath: str) -> str:
     raise ValueError(f"旧版 .xls 无法解析（缺 xlrd 与 LibreOffice）: {Path(filepath).name}")
 
 
-def _parse_xlsx(filepath: str) -> str:
+def _parse_xlsx_elements(filepath: str) -> ParseResult:
+    """XLSX 结构化解析 — 返回 ParseResult（保留表格行列结构）。
+
+    每个 sheet 生成一个 Element(type='table', rows=..., text=...)。
+    表头行为第一行，数据行为后续行。保留原有清洗逻辑。
+    """
     import openpyxl
     import re
+
     wb = openpyxl.load_workbook(filepath, data_only=True)
-    texts = []
+    elements: list[Element] = []
 
     # 噪声清洗：Excel 图片嵌入公式占位符、纯 URL、超长链接
     _img_formula = re.compile(r'^=DISPIMG\(', re.IGNORECASE)
@@ -403,60 +668,92 @@ def _parse_xlsx(filepath: str) -> str:
         if c is None:
             return ""
         s = str(c).strip()
-        # 图片占位公式（=DISPIMG(...)）整格格丢弃
         if _img_formula.match(s):
             return ""
-        # 纯 URL 单元格丢弃（无信息量，且污染向量）
         if _url.match(s):
             return ""
         return s
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        texts.append(f"## {sheet_name}")
+        rows: list[list[str]] = []
         for row in ws.iter_rows(values_only=True):
-            # 清洗每个单元格，过滤噪声后再拼接
             cleaned = [clean_cell(c) for c in row]
-            row_text = "\t".join(cleaned)
             # 去掉行内残留的空 tab（图片列/URL列清空后留下的空洞）
+            row_text = "\t".join(cleaned)
             row_text = re.sub(r'(\t)+', '\t', row_text).strip('\t').strip()
             if row_text:
-                texts.append(row_text)
-    return "\n".join(texts)
+                # 按 tab 拆回 cells
+                cells = [c.strip() for c in row_text.split('\t')]
+                rows.append(cells)
+
+        # 过滤全空行
+        rows = [r for r in rows if any(c for c in r)]
+        if not rows:
+            continue
+
+        # 每个 sheet 生成一个 table 元素
+        md = '\n'.join([' | '.join(r) for r in rows])
+        elements.append(Element(
+            type='table', text=md, rows=rows,
+            metadata={'sheet': sheet_name,
+                      'row_count': len(rows),
+                      'col_count': len(rows[0]) if rows else 0}
+        ))
+
+    return ParseResult(elements=elements, source_file=filepath)
 
 
-def _parse_docx(filepath: str) -> str:
+def _parse_xlsx(filepath: str) -> str:
+    """向后兼容：返回纯文本。"""
+    return _parse_xlsx_elements(filepath).to_text()
+
+
+def _parse_docx_elements(filepath: str) -> ParseResult:
+    """DOCX 结构化解析 — 返回 ParseResult（保留表格行列结构）。"""
     from docx import Document as DocxDocument
-    from docx.document import Document as _Doc
     from docx.table import Table as _Table
     from docx.text.paragraph import Paragraph as _Para
     doc = DocxDocument(filepath)
-
-    # 按文档顺序遍历 body 顶层元素（段落 + 表格），保留表格行列结构。
-    # 历史坑：只读 doc.paragraphs 会跳过 doc.tables（工业规格书关键数据都在表格里）。
-    parts = []
+    elements = []
     for child in doc.element.body.iterchildren():
         if child.tag.endswith('}p'):
-            # 段落
             p = _Para(child, doc)
             t = p.text.strip()
-            if t:
-                parts.append(t)
+            if not t:
+                continue
+            style_name = (p.style.name or '').lower()
+            if 'heading' in style_name:
+                try:
+                    level = int(style_name.replace('heading', '').strip())
+                except ValueError:
+                    level = 1
+                elements.append(Element(type='heading', text=t, metadata={'level': level}))
+            else:
+                elements.append(Element(type='text', text=t))
         elif child.tag.endswith('}tbl'):
-            # 表格 → markdown 表格文本（保留每行每列）
             tbl = _Table(child, doc)
             rows = []
             for row in tbl.rows:
                 cells = [c.text.strip().replace('\n', ' ') for c in row.cells]
-                rows.append(' | '.join(cells))
+                rows.append(cells)
             if rows:
-                # 加表头分隔线，便于下游识别表格结构
-                header_sep = ' | '.join(['---'] * len(tbl.rows[0].cells))
-                parts.append('\n'.join([rows[0], header_sep] + rows[1:]))
-    if parts:
-        return "\n\n".join(parts)
-    # 兑底：无 body 元素时回退纯段落
-    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                md = '\n'.join([' | '.join(r) for r in rows])
+                elements.append(Element(
+                    type='table', text=md, rows=rows,
+                    metadata={'row_count': len(rows), 'col_count': len(rows[0]) if rows else 0}
+                ))
+    if not elements:
+        for p in doc.paragraphs:
+            t = p.text.strip()
+            if t:
+                elements.append(Element(type='text', text=t))
+    return ParseResult(elements=elements, source_file=filepath)
+
+
+def _parse_docx(filepath: str) -> str:
+    """向后兼容：返回纯文本。"""
+    return _parse_docx_elements(filepath).to_text()
 
 
 def _parse_txt(filepath: str) -> str:

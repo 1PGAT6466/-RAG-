@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PDF 预览</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { background: #3a3a3a; height: 100%; overflow: hidden; }
+    body { overflow-y: auto; }
+    #toolbar {
+      position: fixed; top: 0; left: 0; right: 0; height: 40px; z-index: 100;
+      background: #2a2a2a; display: flex; align-items: center; padding: 0 16px; gap: 10px;
+      font: 13px -apple-system, sans-serif; color: #ccc; border-bottom: 1px solid #444;
+    }
+    #toolbar button {
+      background: #444; border: none; color: #ddd; padding: 5px 14px;
+      border-radius: 4px; cursor: pointer; font-size: 13px;
+    }
+    #toolbar button:hover { background: #555; }
+    #toolbar button:disabled { opacity: 0.3; cursor: default; }
+    #toolbar button.active { background: #0e6e6a; color: #fff; }
+    #page-info { min-width: 80px; text-align: center; }
+    #zoom-info { min-width: 50px; text-align: center; }
+    .tb-sep { width: 1px; height: 20px; background: #555; margin: 0 4px; }
+
+    /* 双页行 */
+    .spread-row {
+      display: flex; justify-content: center; margin: 4px auto;
+    }
+    .spread-row canvas, .spread-row .ph {
+      display: block; box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+    }
+    .page-left canvas { border-right: 1px solid #555; }
+    .page-right canvas { border-left: 1px solid #555; }
+    .ph { background: #eee; display: flex; align-items: center; justify-content: center; color: #aaa; font: 12px sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <button id="btn-prev" disabled>◀</button>
+    <span id="page-info">- / -</span>
+    <button id="btn-next" disabled>▶</button>
+    <div class="tb-sep"></div>
+    <button id="btn-zoom-out">−</button>
+    <span id="zoom-info">适合宽度</span>
+    <button id="btn-zoom-in">+</button>
+    <div class="tb-sep"></div>
+    <button id="btn-fit" class="active">双页</button>
+    <button id="btn-single">单页</button>
+  </div>
+  <div id="viewer" style="margin-top:48px; padding-bottom:20px;"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.mjs" type="module"></script>
+  <script type="module">
+    const pdfjsLib = await import('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.mjs');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.mjs';
+
+    const cfg = window.__PDF_CONFIG || {};
+    const params = new URLSearchParams(location.search);
+    const fileId = cfg.fileId || params.get('file_id');
+    const token = cfg.token || params.get('token');
+    if (!fileId) {
+      document.body.innerHTML = '<div style="color:#ccc;text-align:center;padding:60px">缺少 file_id</div>';
+      throw new Error('missing file_id');
+    }
+    const baseUrl = cfg.baseUrl || location.origin;
+    const pdfUrl = `${baseUrl}/api/documents/${fileId}/raw?token=${encodeURIComponent(token || '')}`;
+
+    const viewer = document.getElementById('viewer');
+    const btnPrev = document.getElementById('btn-prev');
+    const btnNext = document.getElementById('btn-next');
+    const btnZoomIn = document.getElementById('btn-zoom-in');
+    const btnZoomOut = document.getElementById('btn-zoom-out');
+    const btnFit = document.getElementById('btn-fit');
+    const btnSingle = document.getElementById('btn-single');
+    const pageInfo = document.getElementById('page-info');
+    const zoomInfo = document.getElementById('zoom-info');
+
+    let pdfDoc = null;
+    let totalPages = 0;
+    let viewMode = 'spread'; // 'spread' | 'single'
+    let isRendering = false;
+    let renderedSoFar = 0; // 已渲染到第几页（用于增量追加）
+
+    // ========== 加载 PDF ==========
+    pdfjsLib.getDocument(pdfUrl).promise.then(pdf => {
+      pdfDoc = pdf;
+      totalPages = pdf.numPages;
+      pageInfo.textContent = `1 / ${totalPages}`;
+      btnNext.disabled = totalPages <= 1;
+      renderFromPage(1);
+    }).catch(err => {
+      viewer.innerHTML = `<div style="color:#ccc;text-align:center;padding:60px">加载失败：${err.message}</div>`;
+    });
+
+    // ========== 计算容器可用宽度 ==========
+    function containerWidth() {
+      return viewer.clientWidth - 16;
+    }
+
+    // ========== 从第 startPage 页开始串行渲染 ==========
+    async function renderFromPage(startPage) {
+      if (isRendering) return;
+      isRendering = true;
+      renderedSoFar = startPage - 1;
+
+      const cW = containerWidth();
+
+      if (viewMode === 'spread') {
+        // 双页模式：每次取两页，并排渲染
+        for (let i = startPage; i <= totalPages; i += 2) {
+          const leftNum = i;
+          const rightNum = i + 1 <= totalPages ? i + 1 : null;
+          await renderSpreadPair(leftNum, rightNum, cW);
+          renderedSoFar = i + (rightNum ? 1 : 0);
+          // 给浏览器喘息时间，避免卡死
+          await new Promise(r => requestAnimationFrame(r));
+        }
+      } else {
+        // 单页模式
+        for (let i = startPage; i <= totalPages; i++) {
+          await renderSinglePage(i, cW);
+          renderedSoFar = i;
+          await new Promise(r => requestAnimationFrame(r));
+        }
+      }
+      isRendering = false;
+      updatePageInfo();
+    }
+
+    // ========== 双页并排渲染一对 ==========
+    async function renderSpreadPair(leftNum, rightNum, cW) {
+      // 获取两页的原始宽高比
+      const leftPage = await pdfDoc.getPage(leftNum);
+      const leftVP = leftPage.getViewport({ scale: 1.0 });
+      const leftRatio = leftVP.height / leftVP.width;
+
+      let rightPage = null, rightVP = null, rightRatio = 0;
+      if (rightNum) {
+        rightPage = await pdfDoc.getPage(rightNum);
+        rightVP = rightPage.getViewport({ scale: 1.0 });
+        rightRatio = rightVP.height / rightVP.width;
+      }
+
+      // 两页等高，按比例分配宽度（无空隙）
+      const totalRatio = leftRatio + rightRatio;
+      const rowH = cW / totalRatio;
+      const leftW = rowH * leftRatio;
+      const rightW = rightNum ? rowH * rightRatio : 0;
+
+      // 创建行
+      const row = document.createElement('div');
+      row.className = 'spread-row';
+      row.dataset.left = leftNum;
+      row.dataset.right = rightNum || '';
+      row.style.height = rowH + 'px';
+
+      // 左页占位
+      const leftPh = document.createElement('div');
+      leftPh.className = 'ph page-left';
+      leftPh.style.width = leftW + 'px';
+      leftPh.style.height = rowH + 'px';
+      row.appendChild(leftPh);
+
+      // 右页占位
+      let rightPh = null;
+      if (rightNum) {
+        rightPh = document.createElement('div');
+        rightPh.className = 'ph page-right';
+        rightPh.style.width = rightW + 'px';
+        rightPh.style.height = rowH + 'px';
+        row.appendChild(rightPh);
+      }
+
+      viewer.appendChild(row);
+
+      // 渲染左页
+      const dpr = window.devicePixelRatio || 1;
+      const leftRenderScale = (leftW / leftVP.width) * dpr;
+      const leftRenderVP = leftPage.getViewport({ scale: leftRenderScale });
+      const leftCanvas = document.createElement('canvas');
+      leftCanvas.width = leftRenderVP.width;
+      leftCanvas.height = leftRenderVP.height;
+      leftCanvas.style.width = leftW + 'px';
+      leftCanvas.style.height = rowH + 'px';
+      await leftPage.render({ canvasContext: leftCanvas.getContext('2d'), viewport: leftRenderVP }).promise;
+      leftPh.replaceWith(leftCanvas);
+
+      // 渲染右页
+      if (rightPage && rightPh) {
+        const rightRenderScale = (rightW / rightVP.width) * dpr;
+        const rightRenderVP = rightPage.getViewport({ scale: rightRenderScale });
+        const rightCanvas = document.createElement('canvas');
+        rightCanvas.width = rightRenderVP.width;
+        rightCanvas.height = rightRenderVP.height;
+        rightCanvas.style.width = rightW + 'px';
+        rightCanvas.style.height = rowH + 'px';
+        await rightPage.render({ canvasContext: rightCanvas.getContext('2d'), viewport: rightRenderVP }).promise;
+        rightPh.replaceWith(rightCanvas);
+      }
+    }
+
+    // ========== 单页渲染 ==========
+    async function renderSinglePage(pageNum, cW) {
+      const page = await pdfDoc.getPage(pageNum);
+      const vp = page.getViewport({ scale: 1.0 });
+      const ratio = vp.height / vp.width;
+      const displayH = cW / ratio;
+
+      const row = document.createElement('div');
+      row.className = 'spread-row';
+      row.dataset.page = pageNum;
+      row.style.height = displayH + 'px';
+
+      const ph = document.createElement('div');
+      ph.className = 'ph';
+      ph.style.width = cW + 'px';
+      ph.style.height = displayH + 'px';
+      row.appendChild(ph);
+      viewer.appendChild(row);
+
+      const dpr = window.devicePixelRatio || 1;
+      const renderScale = (cW / vp.width) * dpr;
+      const renderVP = page.getViewport({ scale: renderScale });
+      const canvas = document.createElement('canvas');
+      canvas.width = renderVP.width;
+      canvas.height = renderVP.height;
+      canvas.style.width = cW + 'px';
+      canvas.style.height = displayH + 'px';
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: renderVP }).promise;
+      ph.replaceWith(canvas);
+    }
+
+    // ========== 页码更新 ==========
+    function updatePageInfo() {
+      const mid = window.innerHeight / 2;
+      const rows = viewer.querySelectorAll('.spread-row');
+      for (const row of rows) {
+        const rect = row.getBoundingClientRect();
+        if (rect.top <= mid && rect.bottom >= mid) {
+          const l = row.dataset.left;
+          const r = row.dataset.right;
+          const p = row.dataset.page;
+          if (l) pageInfo.textContent = r ? `${l}-${r} / ${totalPages}` : `${l} / ${totalPages}`;
+          else if (p) pageInfo.textContent = `${p} / ${totalPages}`;
+          break;
+        }
+      }
+    }
+
+    let scrollTimer = null;
+    window.addEventListener('scroll', () => {
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(updatePageInfo, 100);
+    }, { passive: true });
+
+    // ========== 导航 ==========
+    function scrollToPage(num) {
+      const rows = viewer.querySelectorAll('.spread-row');
+      for (const row of rows) {
+        const l = parseInt(row.dataset.left) || 0;
+        const r = parseInt(row.dataset.right) || 0;
+        const p = parseInt(row.dataset.page) || 0;
+        if (num === l || num === r || num === p) {
+          row.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          break;
+        }
+      }
+    }
+
+    let currentPage = 1;
+    btnPrev.addEventListener('click', () => {
+      currentPage = viewMode === 'spread' ? Math.max(1, currentPage - 2) : Math.max(1, currentPage - 1);
+      scrollToPage(currentPage);
+    });
+    btnNext.addEventListener('click', () => {
+      currentPage = viewMode === 'spread' ? Math.min(totalPages, currentPage + 2) : Math.min(totalPages, currentPage + 1);
+      scrollToPage(currentPage);
+    });
+
+    // ========== 模式切换 ==========
+    function switchMode(mode) {
+      viewMode = mode;
+      viewer.innerHTML = '';
+      if (mode === 'spread') {
+        btnFit.classList.add('active'); btnSingle.classList.remove('active');
+      } else {
+        btnSingle.classList.add('active'); btnFit.classList.remove('active');
+      }
+      renderFromPage(1);
+    }
+
+    btnFit.addEventListener('click', () => switchMode('spread'));
+    btnSingle.addEventListener('click', () => switchMode('single'));
+
+    // ========== 缩放（固定适合宽度，只切换模式） ==========
+    btnZoomIn.style.display = 'none';
+    btnZoomOut.style.display = 'none';
+    zoomInfo.textContent = '适合宽度';
+
+    // ========== 键盘 ==========
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft' || e.key === 'PageUp') { btnPrev.click(); e.preventDefault(); }
+      if (e.key === 'ArrowRight' || e.key === 'PageDown') { btnNext.click(); e.preventDefault(); }
+    });
+  </script>
+</body>
+</html>

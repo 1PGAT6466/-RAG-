@@ -7,12 +7,18 @@ from src.auth.jwt import verify_token
 
 
 async def get_current_user(request: Request):
-    """从 Authorization: Bearer <token> 解析当前用户，失败抛 401。"""
+    """从 Authorization: Bearer <token> 或 ?token=xxx 解析当前用户，失败抛 401。
+    后者供 iframe 等无法设 Authorization header 的场景。"""
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    raw_token = None
+    if auth.startswith("Bearer "):
+        raw_token = auth[7:]
+    if not raw_token:
+        raw_token = request.query_params.get("token")
+    if not raw_token:
         raise HTTPException(401, "未登录")
     try:
-        return verify_token(auth[7:])
+        return verify_token(raw_token)
     except Exception as e:
         import jwt as _jwt
         if isinstance(e, (_jwt.InvalidTokenError, _jwt.ExpiredSignatureError)):

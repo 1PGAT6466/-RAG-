@@ -14,18 +14,21 @@ router = APIRouter()
 
 @router.get("/api/graph")
 def api_graph(user=Depends(get_current_user)):
+    """获取知识图谱数据（节点+边）"""
     data = get_graph_data()
     return {"status": "ok", "data": data}
 
 
 @router.get("/api/entities")
 def api_entities(etype: str = None, user=Depends(get_current_user)):
+    """获取实体列表（可按类型过滤）"""
     entities = list_entities(etype=etype)
     return {"status": "ok", "data": entities}
 
 
 @router.get("/api/entities/graph")
 def api_entity_graph(etype: str = None, user=Depends(get_current_user)):
+    """获取实体关系图（可按类型过滤）"""
     types = [t.strip() for t in etype.split(",") if t.strip()] if etype else None
     data = get_entity_graph(types=types)
     return {"status": "ok", "data": data}
@@ -33,7 +36,13 @@ def api_entity_graph(etype: str = None, user=Depends(get_current_user)):
 
 @router.get("/api/entities/{entity_id}/graph")
 def api_entity_local_graph(entity_id: int, hops: int = 2, max_nodes: int = 200, user=Depends(get_current_user)):
-    """局部图谱：从某实体出发取 N 跳邻域（Obsidian 式聚焦展开）"""
+    """局部图谱：从某实体出发取 N 跳邻域（Obsidian 式聚焦展开）
+
+    Args:
+        entity_id: 实体 ID
+        hops: 跳数（1-5，默认 2）
+        max_nodes: 最大节点数（默认 200）
+    """
     entity = get_entity(entity_id)
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")
@@ -43,6 +52,7 @@ def api_entity_local_graph(entity_id: int, hops: int = 2, max_nodes: int = 200, 
 
 @router.get("/api/entities/{entity_id}")
 def api_entity_detail(entity_id: int, user=Depends(get_current_user)):
+    """获取实体详情（含 chunks、files、规格参数、关系）"""
     entity = get_entity(entity_id)
     if not entity:
         raise HTTPException(status_code=404, detail="实体不存在")

@@ -27,16 +27,20 @@ def _build_provider_chain(prefer_mimo: bool = False) -> list[tuple[str, str, str
     默认：DeepSeek Flash → DeepSeek Pro → MiMo
     prefer_mimo=True：MiMo → DeepSeek Pro → DeepSeek Flash
     """
+    # 快模型快速失败（20s），重型模型宽裕（40s），避免快模型等太久或慢模型被误杀
+    _FLASH_TIMEOUT = min(DEEPSEEK_TIMEOUT, 20)
+    _PRO_TIMEOUT = min(DEEPSEEK_TIMEOUT, 40)
+    _MIMO_TIMEOUT = 60
     if prefer_mimo:
         return [
-            ("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL, 60),
-            ("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_TIMEOUT),
-            ("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL, DEEPSEEK_TIMEOUT),
+            ("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL, _MIMO_TIMEOUT),
+            ("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, _PRO_TIMEOUT),
+            ("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL, _FLASH_TIMEOUT),
         ]
     return [
-        ("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL, DEEPSEEK_TIMEOUT),
-        ("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_TIMEOUT),
-        ("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL, 60),
+        ("deepseek-flash", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_FLASH_MODEL, _FLASH_TIMEOUT),
+        ("deepseek-pro", DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, _PRO_TIMEOUT),
+        ("mimo", MIMO_BASE_URL, MIMO_API_KEY, MIMO_MODEL, _MIMO_TIMEOUT),
     ]
 
 
@@ -56,6 +60,9 @@ def _reasoning_model_tokens(name: str, max_tokens: int) -> int:
     """
     if name == "mimo":
         return max(max_tokens, 4096)
+    # DeepSeek v4 系列也是推理模型（有 reasoning_content），需要更宽裕的预算
+    if "deepseek" in name:
+        return max(max_tokens, 2048)
     return max_tokens
 
 
@@ -97,6 +104,15 @@ async def call_llm(
     for name, base, key, model, timeout in chain:
         if not key:
             continue
+        # P3: 熔断器检查
+        from src.llm.circuit_breaker import get_breaker
+        breaker = get_breaker(name)
+        if breaker.is_open():
+            logger.info(f"{name} 熔断中，跳过")
+            continue
+        if not breaker.acquire_token():
+            logger.info(f"{name} 限流中，跳过")
+            continue
         # 推理型模型需要更宽裕的 max_tokens 预算，避免稳态截空重试
         cur_max_tokens = _reasoning_model_tokens(name, max_tokens)
         try:
@@ -112,32 +128,28 @@ async def call_llm(
                 choice = data["choices"][0]
                 content, reasoning, truncated = _extract_content(choice, name)
                 # 截空：reasoning 耗尽预算只剩思维链 / finish_reason=length 且 content 空。
-                # 用更大预算重试一次（而非直接降级下一个 provider）。
+                # 直接降级到下一个 provider，避免同一 provider 双倍调用成本。
                 if not content.strip() and truncated:
-                    logger.warning(f"{name} 因 max_tokens 截空 content（reasoning={len(reasoning)}字），用大预算重试")
-                    # 截空重试前短暂退避，避免服务端限流窗口内连续撞击
-                    import asyncio
-                    await asyncio.sleep(0.5)
-                    resp2 = await client.post(
-                        f"{base}/chat/completions",
-                        headers=_provider_headers(name, key),
-                        json={"model": model, "messages": messages,
-                              "max_tokens": max(cur_max_tokens * 4, 8192), "temperature": temperature},
-                    )
-                    resp2.raise_for_status()
-                    content, _, _ = _extract_content(resp2.json()["choices"][0], name)
+                    logger.warning(f"{name} 因 max_tokens 截空 content（reasoning={len(reasoning)}字），降级下一个 provider")
+                    from src import llm_audit
+                    llm_audit.record_failure(name, "truncated_content")
+                    breaker.record_failure()
+                    continue
                 if content.strip():
                     from src import llm_audit
                     llm_audit.record_call("call_llm", name, messages, content,
                                          (time.perf_counter() - _t0) * 1000)
+                    breaker.record_success()
                     return content
                 logger.warning(f"{name} 返回空 content")
                 from src import llm_audit
                 llm_audit.record_empty_content(name)
+                breaker.record_failure()
         except Exception as e:
             logger.warning(f"{name} 调用失败: {e}")
             from src import llm_audit
             llm_audit.record_failure(name, str(e))
+            breaker.record_failure()
             last_err = e
 
     raise RuntimeError(f"LLM 调用失败（所有 provider 均不可用）") from last_err
@@ -174,6 +186,15 @@ async def call_llm_stream(
     for name, base, key, use_model, timeout in chain:
         if not key:
             continue
+        # P3: 熔断器检查（与 call_llm 对齐）
+        from src.llm.circuit_breaker import get_breaker
+        breaker = get_breaker(name)
+        if breaker.is_open():
+            logger.info(f"{name} 熔断中，跳过")
+            continue
+        if not breaker.acquire_token():
+            logger.info(f"{name} 限流中，跳过")
+            continue
         cur_max_tokens = _reasoning_model_tokens(name, max_tokens)
         yielded_any = False
         try:
@@ -207,14 +228,51 @@ async def call_llm_stream(
                 llm_audit.record_call("call_llm_stream", name, messages, "[stream]",
                                      (time.perf_counter() - _t0) * 1000)
                 return
-            # 整个流未产出任何 token（可能 reasoning 截空或空回复）→ 降级下一个 provider
-            logger.warning(f"{name} 流式未产出任何 token，降级下一个 provider")
+            # 整个流未产出任何 token（可能 reasoning 截空或空回复）→ 大预算重试一次再降级
+            logger.warning(f"{name} 流式未产出任何 token，用大预算重试")
             from src import llm_audit
             llm_audit.record_empty_content(name)
+            import asyncio
+            await asyncio.sleep(0.1)
+            retry_max = max(cur_max_tokens * 4, 8192)
+            retry_yielded = False
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client2:
+                    async with client2.stream(
+                        "POST",
+                        f"{base}/chat/completions",
+                        headers=_provider_headers(name, key),
+                        json={"model": use_model, "messages": messages, "max_tokens": retry_max,
+                              "temperature": temperature, "stream": True},
+                    ) as resp2:
+                        resp2.raise_for_status()
+                        async for line in resp2.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload.strip() == "[DONE]":
+                                break
+                            try:
+                                chunk = _json.loads(payload)
+                                delta = chunk["choices"][0].get("delta", {}) or {}
+                                token = delta.get("content", "")
+                                if token:
+                                    retry_yielded = True
+                                    yield token
+                            except (KeyError, _json.JSONDecodeError):
+                                continue
+            except Exception as re:
+                logger.warning(f"{name} 大预算重试失败: {re}")
+                breaker.record_failure()
+            if retry_yielded:
+                return
+            logger.warning(f"{name} 大预算重试仍无 output，降级下一个 provider")
+            breaker.record_failure()
         except Exception as e:
             logger.warning(f"{name} 流式调用失败: {e}")
             from src import llm_audit
             llm_audit.record_failure(name, str(e))
+            breaker.record_failure()
             last_err = e
 
     raise RuntimeError("LLM 流式调用失败（所有 provider 均不可用）") from last_err
@@ -227,53 +285,55 @@ def call_llm_sync(
     max_tokens: int = 1024,
     temperature: float = 0.2,
     prefer_mimo: bool = False,
-    retry: int = 2,
 ) -> str:
-    """统一 sync LLM 调用，自动降级 + 重试。返回 answer 字符串；全部失败返回空串。"""
+    """统一 sync LLM 调用，自动降级。返回 answer 字符串；全部失败返回空串。"""
     chain = _build_provider_chain(prefer_mimo)
     for name, base, key, model, timeout in chain:
         if not key:
             continue
+        # P3: 熔断器检查
+        from src.llm.circuit_breaker import get_breaker
+        breaker = get_breaker(name)
+        if breaker.is_open():
+            continue
+        if not breaker.acquire_token():
+            continue
         cur_max_tokens = _reasoning_model_tokens(name, max_tokens)
-        for attempt in range(retry):
-            try:
-                _t0 = time.perf_counter()
-                with httpx.Client(timeout=max(timeout, 120)) as client:
-                    resp = client.post(
-                        f"{base}/chat/completions",
-                        headers=_provider_headers(name, key),
-                        json={"model": model, "messages": messages, "max_tokens": cur_max_tokens, "temperature": temperature},
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    choice = data["choices"][0]
-                    content, reasoning, truncated = _extract_content(choice, name)
-                    if not content.strip() and truncated:
-                        logger.warning(f"{name} content 被截空（reasoning={len(reasoning)}字），用大预算重试")
-                        time.sleep(0.5)
-                        resp2 = client.post(
-                            f"{base}/chat/completions",
-                            headers=_provider_headers(name, key),
-                            json={"model": model, "messages": messages,
-                                  "max_tokens": max(cur_max_tokens * 4, 8192), "temperature": temperature},
-                        )
-                        resp2.raise_for_status()
-                        content, _, _ = _extract_content(resp2.json()["choices"][0], name)
-                    if content.strip():
-                        from src import llm_audit
-                        llm_audit.record_call("call_llm_sync", name, messages, content,
-                                             (time.perf_counter() - _t0) * 1000)
-                        return content
-                    logger.warning(f"{name} 返回空 content（第{attempt+1}次），重试")
+        try:
+            _t0 = time.perf_counter()
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(
+                    f"{base}/chat/completions",
+                    headers=_provider_headers(name, key),
+                    json={"model": model, "messages": messages, "max_tokens": cur_max_tokens, "temperature": temperature},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                choice = data["choices"][0]
+                content, reasoning, truncated = _extract_content(choice, name)
+                # 截空：直接降级下一个 provider，不重试同一 provider
+                if not content.strip() and truncated:
+                    logger.warning(f"{name} content 被截空（reasoning={len(reasoning)}字），降级下一个 provider")
                     from src import llm_audit
-                    llm_audit.record_empty_content(name)
-            except Exception as e:
-                logger.warning(f"{name} 调用失败（第{attempt+1}次）: {e}")
+                    llm_audit.record_failure(name, "truncated_content")
+                    breaker.record_failure()
+                    continue
+                if content.strip():
+                    from src import llm_audit
+                    llm_audit.record_call("call_llm_sync", name, messages, content,
+                                         (time.perf_counter() - _t0) * 1000)
+                    breaker.record_success()
+                    return content
+                logger.warning(f"{name} 返回空 content")
                 from src import llm_audit
-                llm_audit.record_failure(name, str(e))
-                if attempt >= retry - 1:
-                    from src import llm_audit as _a
-                    _a.record_retry(name)
+                llm_audit.record_empty_content(name)
+                breaker.record_failure()
+        except Exception as e:
+            logger.warning(f"{name} 调用失败: {e}")
+            from src import llm_audit
+            llm_audit.record_failure(name, str(e))
+            breaker.record_failure()
+            last_err = e
     # 全部 provider 耗尽仍空：记录明确的业务级降级告警（可观测），而非静默 return ""
     #   （调用方拿到空串会走各自的空值兜底，不会写脏数据；但运维侧需知道「LLM 全链空回复」发生）。
     from src import llm_audit

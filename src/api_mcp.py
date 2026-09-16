@@ -133,9 +133,14 @@ def register(router: APIRouter):
             is_remote = bool(full and full.get("remote"))
             if is_remote:
                 transport = "http"
-                # 优先用公开直连 URL（https://mcp.<ns>.ai），否则 deploymentUrl
+                # 用 Smithery 代理 URL（server.smithery.ai），自动带 API Key 认证
                 if not url:
-                    url = resolve_mcp_url(req.qualifiedName, namespace)
+                    from config import SMITHERY_API_KEY
+                    if SMITHERY_API_KEY:
+                        url = f"https://server.smithery.ai/{req.qualifiedName}/mcp?api_key={SMITHERY_API_KEY}"
+                    else:
+                        dep_url = (full or {}).get("deploymentUrl", "")
+                        url = dep_url or resolve_mcp_url(req.qualifiedName, namespace)
             else:
                 transport = "stdio"
 

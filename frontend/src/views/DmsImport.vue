@@ -1,5 +1,6 @@
 <template>
   <div class="dms-page">
+    <PageBack to="/documents" label="返回文档" />
     <div class="page-header">
       <div>
         <h2 class="page-title"><el-icon><Connection /></el-icon>DMS 文档源</h2>
@@ -249,6 +250,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import dmsApi from '../api/dms'
+import PageBack from '../components/PageBack.vue'
 
 const loading = ref(false)
 const importing = ref(false)
@@ -388,7 +390,11 @@ async function doReplaceAll() {
   }
 }
 
+let _treeAbortController = null
+
 async function loadTree() {
+  if (_treeAbortController) _treeAbortController.abort()
+  _treeAbortController = new AbortController()
   loading.value = true
   errorMsg.value = ''
   try {
@@ -426,7 +432,11 @@ function markImported(nodes) {
 }
 
 // 文档列表（分页查阅，每页 50）
+let _docListAbortController = null
+
 async function loadDocList() {
+  if (_docListAbortController) _docListAbortController.abort()
+  _docListAbortController = new AbortController()
   docListLoading.value = true
   docListError.value = ''
   try {
@@ -539,7 +549,7 @@ onMounted(async () => {
 </script>
 
 <style scoped>
-.dms-page { padding: 20px; }
+.dms-page { padding: 20px; height: 100%; overflow-y: auto; }
 .page-header {
   display: flex;
   justify-content: space-between;

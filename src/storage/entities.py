@@ -9,27 +9,27 @@ logger = logging.getLogger('rag.db.entities')
 
 def upsert_entity(name: str, etype: str = "unknown", aliases: list = None,
                   description: str = "", attributes: dict = None) -> int:
-    """插入或更新实体，返回实体 id"""
+    """插入或更新实体，返回实体 id（ON CONFLICT 消除并发竞态）"""
     conn = _get_conn()
-    existing = conn.execute(
-        "SELECT id FROM entities WHERE name=? AND type=?", (name, etype)
-    ).fetchone()
     aliases_json = json.dumps(aliases or [], ensure_ascii=False)
     attrs_json = json.dumps(attributes or {}, ensure_ascii=False)
-    if existing:
-        conn.execute(
-            "UPDATE entities SET aliases=?, description=?, attributes=? WHERE id=?",
-            (aliases_json, description, attrs_json, existing["id"]),
-        )
-        conn.commit()
-        return existing["id"]
     cur = conn.execute(
-        "INSERT INTO entities (name, type, aliases, description, attributes) "
-        "VALUES (?,?,?,?,?)",
+        """INSERT INTO entities (name, type, aliases, description, attributes)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(name, type) DO UPDATE SET
+               aliases=excluded.aliases,
+               description=excluded.description,
+               attributes=excluded.attributes""",
         (name, etype, aliases_json, description, attrs_json),
     )
     conn.commit()
-    return cur.lastrowid
+    # ON CONFLICT UPDATE 时 lastrowid 可能为 0，需补查
+    if cur.lastrowid:
+        return cur.lastrowid
+    row = conn.execute(
+        "SELECT id FROM entities WHERE name=? AND type=?", (name, etype)
+    ).fetchone()
+    return row["id"] if row else 0
 
 
 def add_entity_chunk(entity_id: int, chunk_id: int, mention_count: int = 1) -> None:
@@ -124,14 +124,14 @@ def get_entity_by_name(name: str, etype: str = None) -> dict | None:
 
 
 def get_entity_chunks(entity_id: int) -> list[dict]:
-    """反链：实体被哪些 chunk 提到"""
+    """反链：实体被哪些 chunk 提到（排除已删除文件）"""
     conn = _get_conn()
     rows = conn.execute(
         """
         SELECT ec.chunk_id, ec.mention_count, c.content, c.file_id, c.chunk_index, f.name as file_name
         FROM entity_chunks ec
         JOIN chunks c ON c.id = ec.chunk_id
-        JOIN files f ON f.id = c.file_id
+        JOIN files f ON f.id = c.file_id AND f.deleted_at IS NULL
         WHERE ec.entity_id=? ORDER BY ec.mention_count DESC
         """,
         (entity_id,),
@@ -140,13 +140,13 @@ def get_entity_chunks(entity_id: int) -> list[dict]:
 
 
 def get_entity_files(entity_id: int) -> list[dict]:
-    """反链：实体出现在哪些文件"""
+    """反链：实体出现在哪些文件（排除已删除文件）"""
     conn = _get_conn()
     rows = conn.execute(
         """
         SELECT ef.file_id, ef.mention_count, f.name as file_name, f.category
         FROM entity_files ef
-        JOIN files f ON f.id = ef.file_id
+        JOIN files f ON f.id = ef.file_id AND f.deleted_at IS NULL
         WHERE ef.entity_id=? ORDER BY ef.mention_count DESC
         """,
         (entity_id,),

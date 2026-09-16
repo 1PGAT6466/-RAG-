@@ -91,7 +91,10 @@ def _resolve_multiturn(query: str, history: list[dict]) -> str:
         tail = q
         for r in _MULTITURN_REF:
             if tail.startswith(r):
-                tail = tail[len(r):].lstrip("的")
+                tail = tail[len(r):]
+                # S15: 只去掉一个“的”前缀，而非 lstrip("的") 会误删所有格
+                if tail.startswith("的"):
+                    tail = tail[1:]
                 break
         fused = f"{prev_user} {tail}".strip()
         logger.info(f"多轮融合: '{query[:30]}' -> '{fused[:50]}'")
@@ -126,7 +129,7 @@ async def handle_chat(
     # 模式路由
     if mode == "auto":
         mode = await classify_intent_async(query)
-    if mode not in ("knowledge", "chat", "web"):
+    if mode not in ("knowledge", "chat", "web", "meta"):
         mode = "knowledge"
 
     # 会话历史：传了 conversation_id 且前端未带 history 时，从库读
@@ -135,8 +138,12 @@ async def handle_chat(
         msgs = get_conversation_messages(conversation_id)
         req_history = [{"role": m["role"], "content": m["content"]} for m in msgs]
 
+    # === 元查询（关于知识库本身的提问） ===
+    if mode == "meta":
+        result = await _handle_meta(query, history=req_history)
+
     # === 自由对话 ===
-    if mode == "chat":
+    elif mode == "chat":
         answer = await generate_chat(query, history=req_history)
         result = {"answer": answer, "sources": [], "mode": "chat"}
 
@@ -162,6 +169,38 @@ async def handle_chat(
     return result
 
 
+async def _handle_meta(query: str, history: list[dict] = None) -> dict:
+    """元查询模式：关于知识库本身的提问，直接查数据库而非检索。"""
+    import sqlite3
+    from config import DB_PATH
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM files WHERE deleted_at IS NULL")
+        file_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM chunks")
+        chunk_count = cur.fetchone()[0]
+        cur.execute("SELECT name, category, chunk_count FROM files WHERE deleted_at IS NULL ORDER BY id")
+        files = cur.fetchall()
+        conn.close()
+
+        file_list = "\n".join(
+            f"  - {f[0]}（{f[1] or '未分类'}，{f[2]} 个切块）" for f in files
+        )
+        context = f"知识库共 {file_count} 个文件、{chunk_count} 个切块：\n{file_list}"
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"参考资料：\n\n{context}\n\n问题：{query}"}
+        ]
+        from src.chat.engine import _call_llm_with_fallback
+        answer = await _call_llm_with_fallback(messages, max_tokens=1024)
+        return {"answer": answer, "sources": [], "mode": "meta"}
+    except Exception as e:
+        logger.error(f"元查询失败: {e}")
+        return {"answer": f"查询知识库信息时出错：{e}", "sources": [], "mode": "meta"}
+
+
 async def _handle_web(query: str, history: list[dict]) -> dict:
     """联网搜索模式"""
     from config import TAVILY_API_KEY
@@ -170,14 +209,19 @@ async def _handle_web(query: str, history: list[dict]) -> dict:
         return {"answer": "（提示：当前未配置联网搜索，以下为基于模型知识的回答，非实时信息。）\n\n" + answer,
                 "sources": [], "mode": "chat"}
 
-    from src.chat.web_search import web_search
-    web_results = await web_search(query, max_results=5)
+    from src.chat.web_search import web_search, filter_by_relevance, refine_web_results
+    web_results = await web_search(query, max_results=10)
     if not web_results:
         answer = await generate_chat(query, history=history)
         return {"answer": "（联网搜索未能获取结果，以下为基于模型知识的回答。）\n\n" + answer,
                 "sources": [], "mode": "chat"}
 
-    answer, web_sources = await generate_web(query, web_results)
+    # 1. 关键词相关性过滤（去噪）
+    web_results = filter_by_relevance(query, web_results)
+    # 2. LLM 摘要提纯（提取关键信息，压缩上下文）
+    refined_context = await refine_web_results(query, web_results)
+
+    answer, web_sources = await generate_web(query, web_results, refined_context=refined_context)
     return {"answer": answer, "sources": web_sources, "mode": "web"}
 
 
@@ -210,7 +254,7 @@ async def _handle_knowledge(query: str, top_k: int, history: list[dict] = None) 
     # Adaptive-RAG：简单查询跳过检索
     complexity = classify_complexity(query)
     if complexity == "simple":
-        answer = await generate_chat(query)
+        answer = await generate_chat(query, history=history)
         return {"answer": answer, "sources": [], "mode": "chat"}
 
     # 语义缓存（仅非多轮融合查询；多轮融合依赖 history 语境，缓存 key 无法表达有态语境，
@@ -254,7 +298,7 @@ async def _handle_knowledge(query: str, top_k: int, history: list[dict] = None) 
                 "sources": [], "mode": "knowledge"}
 
     _t = _time.perf_counter()
-    answer, refs = await generate(query, results)
+    answer, refs = await generate(search_query_base if multiturn_fused else query, results)
     _stages["generate"] = round((_time.perf_counter() - _t) * 1000, 1)
     # 引用忠实度校验 + 杜撰编号清洗：回验 LLM 杜撰编号/模糊引用
     #   - 越界编号（[6] 但 refs 只有 5 条）在进前端前被洗除，避免用户点到空脚注

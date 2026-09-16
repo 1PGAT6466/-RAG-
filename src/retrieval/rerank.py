@@ -1,4 +1,4 @@
-"""
+﻿"""
 rerank.py — Rerank 精排降级链（移植自 RAG伏羲 src/taiyang/rerank.py）
 
 优先级（三级降级）：
@@ -98,7 +98,7 @@ async def rerank_with_deepseek(query, candidates, top_k=30):
 
     scores = [0.0] * len(candidates)  # 预填，保证与 candidates 严格对齐
     try:
-        from src.llm import call_llm, extract_json
+        from src.llm_client import call_llm, extract_json
         for start in range(0, len(candidates), _DEEPSEEK_BATCH):
             batch = documents[start:start + _DEEPSEEK_BATCH]
             doc_list = "\n".join(f"[{i}] {d[:400]}" for i, d in enumerate(batch))
@@ -139,7 +139,13 @@ async def rerank_with_deepseek(query, candidates, top_k=30):
 
 
 def rerank_local(query, candidates, top_k=30):
-    """L3: 本地 TF-IDF + jieba 精排（零依赖兜底）"""
+    """L3: 本地 TF-IDF + jieba 精排（零依赖兜底）
+
+    算法：
+    1. jieba 分词 query → 计算每个 token 在文档中的 TF-IDF 分数
+    2. 对 TF-IDF 分数和原始 RRF 分数分别做 min-max 归一化
+    3. 融合公式：score = original * 0.6 + tfidf * 0.4
+    """
     if not candidates:
         return candidates
 
@@ -180,14 +186,19 @@ def rerank_local(query, candidates, top_k=30):
     min_raw = min(raw_scores) if raw_scores else 0.0
     span = max_raw - min_raw if max_raw > min_raw else 1.0
 
+    # S2: 对 original (RRF 分) 也做 min-max 归一化，使两个分数量纲统一到 [0,1]
+    originals = [float(r.get("score", 0)) for _, r, _ in scored]
+    max_orig = max(originals) if originals else 0.0
+
     result = []
-    for _, r, raw in scored:
-        original = float(r.get("score", 0))
+    for idx, (_, r, raw) in enumerate(scored):
+        original = originals[idx]
         norm_score = (raw - min_raw) / span  # 归一化到 [0,1]
+        norm_original = original / max_orig if max_orig > 0 else original
         rr = dict(r)
         rr["_rerank_score"] = round(raw, 4)
         rr["_rerank_source"] = "local-tfidf"
-        rr["score"] = round(original * 0.6 + norm_score * 0.4, 4)
+        rr["score"] = round(norm_original * 0.6 + norm_score * 0.4, 4)
         result.append(rr)
 
     result.sort(key=lambda x: x["score"], reverse=True)
