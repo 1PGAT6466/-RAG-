@@ -74,6 +74,14 @@ async def lifespan(app: FastAPI):
             logger.warning(f"FTS 对账结果: {stats}")
     except Exception as e:
         logger.warning(f"FTS 对账失败（不影响主服务）: {e}")
+    # 自愈：files.chunk_count 与 chunks 实际行数对账（流式入库中断会遗留漂移）
+    try:
+        from src.storage.files import reconcile_chunk_counts
+        n = reconcile_chunk_counts()
+        if n:
+            logger.info(f"chunk_count 自愈: 修正 {n} 个文件的计数漂移")
+    except Exception as e:
+        logger.warning(f"chunk_count 对账失败（不影响主服务）: {e}")
     # #10：清理过期持久缓存（rerank_cache TTL + semantic_cache 上限）
     try:
         from src.retrieval.rerank import purge_expired_rerank_cache

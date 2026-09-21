@@ -16,6 +16,7 @@ from src.storage.files import (
     update_file_category, update_file_tags, update_file_summary, update_file_folder,
     update_file_doc_meta, get_file_authority,
     normalize_folder, list_folders, delete_file, sync_chunk_count,
+    reconcile_chunk_counts,
     add_images, list_images, count_images,
 )
 # Chunk + FTS5 搜索 + 链接

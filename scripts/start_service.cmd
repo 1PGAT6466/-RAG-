@@ -1,32 +1,30 @@
 @echo off
-title FuXi RAG Service
-cd /d E:\����RAG���
+chcp 65001 >nul
+title 伏羲 RAG - 启动服务
+cd /d "%~dp0.."
 
 echo ============================================
-echo    FuXi RAG - Start Service
-echo ============================================
-echo.
-
-netstat -ano | findstr ":8099" | findstr "LISTENING" >nul
-if errorlevel 1 goto run
-
-echo [!] Port 8099 is already in use. Service may be running.
-echo     To restart, run "Stop FuXi Service" on your desktop first.
-echo.
-pause
-exit
-
-:run
-echo [*] Starting service...
-echo     Intranet: http://172.25.30.11:8099
-echo     Local:    http://127.0.0.1:8099
-echo.
-echo     Close this window (or press Ctrl+C) to stop the service.
+echo    伏羲 RAG - 启动服务
 echo ============================================
 echo.
 
-"C:\Users\feng-shaoxuan\AppData\Local\easyclaw\ai\tool_cache\resources\tools\win\python-3.11.9\python.exe" server.py
+python scripts\ragctl.py start
+if errorlevel 1 (
+  echo.
+  echo [!] 启动失败。排查建议：
+  echo     1. python scripts\ragctl.py logs 100     ^<- 看启动日志
+  echo     2. python scripts\ragctl.py doctor        ^<- 全链路体检
+  echo.
+  pause
+  exit /b 1
+)
 
 echo.
-echo [*] Service stopped.
+echo [OK] 服务已启动。
+echo     本机:  http://127.0.0.1:8099
+echo     内网:  http://172.25.30.11:8099
+echo.
+echo     查看状态: python scripts\ragctl.py status
+echo     停止服务: 双击 "停止伏羲服务" 或 python scripts\ragctl.py stop
+echo.
 pause

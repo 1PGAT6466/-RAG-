@@ -308,6 +308,26 @@ def sync_chunk_count(file_id: int):
     conn.commit()
 
 
+def reconcile_chunk_counts() -> int:
+    """对账并修复所有 files 的 chunk_count（批量，单条 SQL）。
+
+    背景：流式入库是「逐批写 chunk」，若入库中途服务重启/被杀，
+    sync_chunk_count 未执行到，chunk_count 会永久停留在旧值（如 0），
+    导致前端计数不准、health_check 报漂移。本函数在启动时批量自愈。
+
+    返回：被修正的行数。
+    """
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE files SET chunk_count = "
+        "(SELECT COUNT(*) FROM chunks WHERE chunks.file_id = files.id) "
+        "WHERE chunk_count IS NOT "
+        "(SELECT COUNT(*) FROM chunks WHERE chunks.file_id = files.id)"
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
 def update_file_doc_meta(file_id: int, doc_kind: str, authority: int):
     """写入文档类型 + 权威等级（元数据层，检索精准度消费）"""
     conn = _get_conn()

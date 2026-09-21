@@ -1,26 +1,14 @@
 @echo off
-title Stop FuXi RAG Service
-cd /d E:\¸üÐÂRAG¿ò¼Ü
+chcp 65001 >nul
+title ä¼ç¾² RAG - åœæ­¢æœåŠ¡
+cd /d "%~dp0.."
 
 echo ============================================
-echo    FuXi RAG - Stop Service
+echo    ä¼ç¾² RAG - åœæ­¢æœåŠ¡
 echo ============================================
 echo.
 
-set killed=0
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8099" ^| findstr "LISTENING"') do call :kill %%a
-goto :done
+python scripts\ragctl.py stop
 
-:kill
-taskkill /f /pid %1 >nul 2>&1
-set killed=1
-goto :eof
-
-:done
-if "%killed%"=="1" (
-  echo [OK] Service stopped.
-) else (
-  echo [!] Port 8099 not listening. Service may not be running.
-)
 echo.
 pause

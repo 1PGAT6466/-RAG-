@@ -34,10 +34,19 @@
 - **上传白名单**：`config.UPLOAD_ALLOWED_EXT`（pdf/doc/docx/xls/xlsx/ppt/pptx/txt/csv/md/log/json/xml）；上传走临时文件流式 + 增量 sha256。
 - **feedback 写接口限流** 30/min per-user + `(user_id,kind,query,chunk_ids)` 幂等去重。
 - **破坏性脚本**（wipe_data/reset_data）必须 `--yes`，且自动备份 rag.db。
+- **Git 仓库**：`origin=https://github.com/1PGAT6466/-RAG-.git`（分支 master）。
+  - ⚠️ **token 不得写进 remote URL**：历史曾配成 `https://ghp_xxx@github.com/...`（会在 `.git/config` 明文存令牌），已于 2026-09-21 改为纯 URL + `credential.helper=manager`。
+  - ⚠️ **本机直连 github.com 不稳定**（2026-09-21 实测）：TLS 握手可过，但 `github.com`/`api.github.com` 持续返回 000（`codeload.github.com` 反可通）。推送失败是网络层拦截，非认证/配置问题。需要时可考虑 SSH 端口 22 / 443，或 hosts 绑定可用 IP（需管理员）。
 - **示例脚本**：`scripts/scratch/` 放临时调试脚本；正式脚本在 `scripts/` 根。
 - **守护进程**：#17 产物 = `scripts/install_service.cmd`（Windows/NSSM）+ `scripts/fuxi-rag.service`（Linux systemd），保持 workers=1（SQLite 单写者），崩溃自动重拉；属部署产物，开发机未安装。
 - **测试基础设施**：`tests/test_e2e_flow.py`=离线打桩 e2e（永远可跑）；`tests/test_e2e_real_flow.py`=真实闭环 e2e（真实 BGE+存储+检索，有模型则跑无则 skip，`RAG_E2E_REAL=force/0` 强制）。真实 e2e 用全局串行锁；测试改 DB 路径必须改 `connection.DB_PATH`（该模块顶层 `from config import DB_PATH` 快照，只改 config 无效）。
 - **异步测试一律 `asyncio.run()`**：禁用 `asyncio.get_event_loop()`（Python 3.11 下若同进程先跑过 TestClient 会抛 no current event loop）。
+- **统一运维入口：`python scripts/ragctl.py <命令>`**（2026-09-21 重写）。命令：status/doctor/diag/health/tasks/backup/logs/metrics/fts-reconcile/reset-vector/start/stop/restart。手册：`docs/运维手册.md`。
+  - `doctor` = 全链路体检（进程/端口/HTTP/DB一致性/向量库/FTS/配置/磁盘/日志错误）+ 修复建议，退出码 0/1 可供 cron 消费。
+  - `diag` = 打包脱敏诊断包成 `data/diag/*.zip`（密钥只留前 6 位）。
+  - 备份产物命名 `data/backup/rag-<时间戳>.zip`（backup.py 的 VACUUM 快照，含 db+chroma+uploads+images+.env）。
+- **启动自愈**：`reconcile_chunk_counts()` —— 流式入库中断（服务重启）会遗留 `files.chunk_count` 漂移，lifespan 启动时自动对账修正。
+- **每日巡检**：`scripts/ops_daily.py`（备份+体检，写 `data/logs/ops_daily.log`，有问题非零退出）。已挂 cron：每天 08:30 Asia/Shanghai。
 
 ## 🔴 SeedDMS（原件唯一存储）
 
@@ -56,6 +65,13 @@
 - **#15 真实闭环 e2e 已补齐**（2026-09-21 追加）：`tests/test_e2e_real_flow.py` 3 用例（真实向量化/入库→检索命中/对话装配）；同时修测试隔离（全局串行锁 + DB_PATH 单点 + asyncio.run）。
 - #12 的 LLM 摘要压缩为可选增强，暂用字符滑窗。
 - **全量回归：`python -m pytest tests/ -q` → 217 passed, 10 skipped, 0 failed**。
+
+## 运维体系（2026-09-21 建立）
+
+- **统一入口 `ragctl`**：旧版只做了 start/stop/status/backup/health/logs，本次重写补上 doctor/diag/tasks/metrics/fts-reconcile，并对 status 大幅增强（任务队列/备份/磁盘）。
+- **每日巡检已挂 cron**：每天 08:30（Asia/Shanghai），跑 `scripts/ops_daily.py`（备份 + doctor），报告写 `data/logs/ops_daily.log`。⚠️ 当前无可用投递渠道（webchat/微信/飞书/企微均未绑定），故报告落盘，待渠道可用后再接告警。
+- **启动自愈**：新增 `reconcile_chunk_counts()`，修流式入库中断导致的 files.chunk_count 漂移（本次修好了 id=17 实际 1236 声明 0）。
+- **清理僵尸任务**：入库任务表清出 46 个测试残留/中断僵尸（源文件已缺失），现只剩 2 个 UNIQUE 约束失败的旧记录（非阻塞）。
 
 ## 已知既有问题（非本轮引入，供后续）
 
