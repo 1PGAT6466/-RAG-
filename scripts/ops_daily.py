@@ -26,6 +26,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# 统一标准：与子进程（ragctl）以 UTF-8 交换文本，详见 ragctl.py 同位置注释。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 # 归档目录：与 ragctl 保持一致（按天建文件夹，当天覆盖）
 # \u53ef\u7528\u73af\u5883\u53d8\u91cf RAG_OPS_ARCHIVE \u8986\u76d6
 ARCHIVE_ROOT = Path(os.getenv("RAG_OPS_ARCHIVE", r"E:\测试项目\自建知识库\伏羲运维手册\日志"))

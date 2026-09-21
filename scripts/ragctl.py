@@ -38,6 +38,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# 统一标准：脚本间（ragctl / ops_daily / health_check）一律用 UTF-8 交换文本。
+# Windows 控制台默认代码页是 GBK，父进程若以 utf-8 解码会把中文变成乱码。
+# 这里把自身 stdout/stderr 重置为 UTF-8，从根本上消除乱码。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 DATA_DIR = ROOT / "data"
 PID_FILE = DATA_DIR / "rag.pid"
 LOG_DIR = DATA_DIR / "logs"
@@ -538,20 +547,27 @@ def _doctor_impl() -> int:
         problems.append("db_missing")
 
     # 3b. 数据一致性（复用 health_check.py）
+    # 注意：health_check.py 目前把汇总行写到 stderr（legacy 行为），
+    # 所以必须用 stderr=subprocess.STDOUT 合并两路输出，否则丢关键信息。
+    # 统一以 utf-8 解码（子进程已 reconfigure 为 utf-8）。
+    consistency_output = ""
     try:
         r = subprocess.run([sys.executable, str(ROOT / "scripts" / "health_check.py"),
                             "--db", str(DB_PATH)],
-                           capture_output=True, text=True, timeout=120, cwd=str(ROOT),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=120, cwd=str(ROOT),
                            encoding="utf-8", errors="replace")
+        full = (r.stdout or "").strip()
         if r.returncode == 0:
             _ok("数据一致性巡检通过（无孤儿 chunk / 计数一致 / FTS 行数一致）")
         else:
             _err("数据一致性巡检发现问题（完整输出见下）：")
             # 完整输出（不再截断），便于定位到具体是哪个表/文件漂移
-            full = (r.stdout or "").strip()
             for line in full.splitlines():
                 print(f"           {line}")
             problems.append("data_inconsistency")
+        # 无论成败都保留原始输出供报告展示
+        consistency_output = full
     except Exception as e:
         _warn(f"一致性巡检无法执行: {e}")
 

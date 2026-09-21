@@ -20,6 +20,15 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# 统一标准：本脚本与父进程（ragctl / ops_daily）一律用 UTF-8 交换文本。
+# Windows 控制台默认代码页是 GBK，父进程以 utf-8 解码会把中文变成乱码，
+# 因此这里强制把 stdout/stderr 重置为 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 
 def _check_chunk_count(cur, issues: list):
     """files.chunk_count 与 chunks 实际行数一致性"""
