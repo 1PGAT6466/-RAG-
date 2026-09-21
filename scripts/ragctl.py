@@ -76,12 +76,80 @@ def _log(msg: str = ""):
     print(f"{_TAG} {msg}" if msg else "")
 
 
-# --- 历史记录：改为「按天归档 + 当天覆盖」---
-# 路径：<ARCHIVE_ROOT>/<YYYYMMDD>/doctor_report.txt（当天多次运行只保留最新）
+# --- 历史记录：按天归档 + 当天覆盖，输出 Markdown ---
+# 路径：<ARCHIVE_ROOT>/<YYYYMD>/doctor_report.md 等
 # 保留只限于当天，历史日期文件夹不会被触碰（可自行归档/清理）。
 
+def _to_markdown(title: str, raw: str, ts: str) -> str:
+    """把 ragctl 的纯文本输出转成 Markdown（标题 + 状态表格 + 明细）。
+
+    输入形如：
+        [ragctl] ======
+        [ragctl] 伏羲 RAG 全链路体检
+        [ragctl] ======
+          [OK]   进程存活（PID: 16112）
+          [FAIL] xxx
+    输出带 Markdown 标题、状态图标与列表。
+    """
+    ok_md, warn_md, err_md = [], [], []
+    other = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # 去掉 [ragctl] 前缀与纯分隔线
+        s = s.replace("[ragctl]", "").strip()
+        if not s or set(s) <= {"=", "-"}:
+            continue
+        if "[OK]" in s:
+            ok_md.append(s.replace("[OK]", "").strip())
+        elif "[WARN]" in s:
+            warn_md.append(s.replace("[WARN]", "").strip())
+        elif "[FAIL]" in s:
+            err_md.append(s.replace("[FAIL]", "").strip())
+        else:
+            other.append(s)
+
+    out = [f"# {title}", "", f"> 采集时间：{ts}", ""]
+
+    # 汇总表
+    total = len(ok_md) + len(warn_md) + len(err_md)
+    if err_md:
+        status = "🔴 异常"
+    elif warn_md:
+        status = "🟡 需关注"
+    else:
+        status = "🟢 正常"
+    out += ["## 汇总", "", "| 结果 | 数量 |", "| --- | --- |",
+            f"| 总体状态 | {status} |",
+            f"| ✅ 通过 | {len(ok_md)} |",
+            f"| ⚠️ 关注 | {len(warn_md)} |",
+            f"| ❌ 失败 | {len(err_md)} |", ""]
+
+    if err_md:
+        out += ["## ❌ 需要处理", ""]
+        out += [f"- {x}" for x in err_md]
+        out.append("")
+    if warn_md:
+        out += ["## ⚠️ 需要关注", ""]
+        out += [f"- {x}" for x in warn_md]
+        out.append("")
+    if ok_md:
+        out += ["## ✅ 通过项", ""]
+        out += [f"- {x}" for x in ok_md]
+        out.append("")
+    if other:
+        out += ["## 📄 详细信息", "", "```", *other, "```", ""]
+
+    return "\n".join(out)
+
+
 def _write_daily_report(name: str, text: str) -> Path:
-    """把一份报告写入当天归档目录（同日多次运行直接覆盖）。"""
+    """把一份报告写入当天归档目录（同日多次运行直接覆盖）。
+
+    用 UTF-8 BOM（utf-8-sig）：Markdown 编辑器/Obsidian 能正确识别，
+    Windows 记事本双击也不会中文乱码。
+    """
     d = _today_archive_dir()
     p = d / name
     with open(p, "w", encoding="utf-8-sig") as f:
@@ -89,30 +157,43 @@ def _write_daily_report(name: str, text: str) -> Path:
     return p
 
 
-def _record_history(kind: str, text: str):
-    """把 doctor / status 的完整输出存入当天归档目录（当天内覆盖）。
+def _cleanup_legacy_archives(d: Path):
+    """删除当天目录里的旧格式产物（.txt / .log），只保留 .md 与 .zip。"""
+    for pat in ("*.txt", "*.log"):
+        for old in d.glob(pat):
+            try:
+                old.unlink()
+            except Exception:
+                pass
 
-    - doctor  → doctor_report.txt（体检报告）
-    - status  → status_report.txt（状态快照）
-    同时合并一份 combined_report.txt，方便一次性查看。
+
+def _record_history(kind: str, text: str):
+    """把 doctor / status 的完整输出存入当天归档目录（当天内覆盖，Markdown）。
+
+    - doctor  → doctor_report.md（体检报告）
+    - status  → status_report.md（状态快照）
+    同时合并一份 combined_report.md，方便一次性查看。
     """
     try:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        body = f"[采集时间] {ts}\n{'=' * 60}\n{text}"
-        if kind == "doctor":
-            _write_daily_report("doctor_report.txt", body)
-        elif kind == "status":
-            _write_daily_report("status_report.txt", body)
-        # 合并报告：当天两个命令都跑过则包含两部分，否则只写现有的
         d = _today_archive_dir()
+        if kind == "doctor":
+            _write_daily_report("doctor_report.md", _to_markdown("伏羲 RAG 体检报告", text, ts))
+        elif kind == "status":
+            _write_daily_report("status_report.md", _to_markdown("伏羲 RAG 状态快照", text, ts))
+        # 合并报告：当天两个命令都跑过则包含两部分
         parts = []
-        for f, title in (("status_report.txt", "状态快照"), ("doctor_report.txt", "体检报告")):
+        for f, title in (("status_report.md", "状态快照"), ("doctor_report.md", "体检报告")):
             fp = d / f
             if fp.exists():
-                parts.append(f"######## {title} ########\n" + fp.read_text(
+                parts.append(f"<!-- {title} -->\n" + fp.read_text(
                     encoding="utf-8-sig", errors="replace").rstrip())
         if parts:
-            _write_daily_report("combined_report.txt", "\n\n".join(parts))
+            combined = (f"# 伏羲 RAG 运维报告（{datetime.now().strftime('%Y-%m-%d')}）\n\n"
+                        + "\n\n---\n\n".join(parts) + "\n")
+            _write_daily_report("combined_report.md", combined)
+        # 清理旧格式产物（用户要求：只保留 .md；.zip 不动）
+        _cleanup_legacy_archives(d)
     except Exception:
         pass  # 归档失败绝不影响主命令
 
@@ -797,24 +878,28 @@ def cmd_fts_reconcile(_args) -> int:
 
 
 def cmd_history(args) -> int:
-    """查看当天归档目录里的运维报告。"""
+    """查看当天归档目录里的运维报告（Markdown）。"""
     d = _today_archive_dir()
     _log(f"当日归档目录: {d}")
+
     files = [
-        ("combined_report.txt", "合并报告"),
-        ("status_report.txt", "状态快照"),
-        ("doctor_report.txt", "体检报告"),
+        ("combined_report.md", "合并报告"),
+        ("status_report.md", "状态快照"),
+        ("doctor_report.md", "体检报告"),
+        ("ops_daily.md", "每日巡检"),
     ]
-    shown = False
+    shown = []
     for fn, title in files:
         p = d / fn
         if p.exists():
-            print(f"\n######## {title}（{fn}）########")
+            print(f"\n{'=' * 60}\n# {title}（{fn}）\n{'=' * 60}")
             print(p.read_text(encoding="utf-8-sig", errors="replace"))
-            shown = True
+            shown.append(fn)
+
     if not shown:
         _warn("当日尚无报告（跑一次 ragctl doctor / status 自动生成）")
         return 1
+    _log(f"共 {len(shown)} 份报告，目录: {d}")
     return 0
 
 

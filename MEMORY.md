@@ -47,7 +47,7 @@
   - 备份产物命名 `data/backup/rag-<时间戳>.zip`（backup.py 的 VACUUM 快照，含 db+chroma+uploads+images+.env）。
 - **启动自愈**：`reconcile_chunk_counts()` —— 流式入库中断（服务重启）会遗留 `files.chunk_count` 漂移，lifespan 启动时自动对账修正。
 - **每日巡检**：`scripts/ops_daily.py`（备份+体检，有问题非零退出）。已挂 cron：每天 08:30 Asia/Shanghai。
-- **运维归档（当天覆盖）**：所有运维日志/报告统一到 `E:\测试项目\自建知识库\伏羲运维手册\日志\<YYYYMD>\`（如 `2026921`，月/日不补零）。内含 `combined_report.txt`（合并）/`status_report.txt`/`doctor_report.txt`/`diag_report.zip`/`ops_daily.log`。**每天一文件夹，当天多次运行覆盖旧文件**；历史日期夹不动。可用 `RAG_OPS_ARCHIVE` 环境变量覆盖；归档盘不可用时回退 `data/ops_archive/`。查看：`ragctl history`。
+- **运维归档（当天覆盖，Markdown）**：所有运维日志/报告统一到 `E:\测试项目\自建知识库\伏羲运维手册\日志\<YYYYMD>\`（如 `2026921`，月/日不补零），**全部 .md 格式**：`combined_report.md`（合并）/`status_report.md`/`doctor_report.md`/`ops_daily.md`/`diag_report.zip`。**每天一文件夹，当天多次运行覆盖旧文件**；旧格式 .txt/.log 会被自动清理。可用 `RAG_OPS_ARCHIVE` 环境变量覆盖；归档盘不可用时回退 `data/ops_archive/`。查看：`ragctl history`。
 
 ## 🔴 SeedDMS（原件唯一存储）
 
