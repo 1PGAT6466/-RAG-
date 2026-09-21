@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port 3000",
+    "dev": "vite --port 4999",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -15,6 +15,7 @@
     "dompurify": "^3.4.13",
     "element-plus": "^2.14.4",
     "marked": "^9.1.6",
+    "pdfjs-dist": "^4.0.379",
     "pinia": "^2.3.1",
     "vue": "^3.5.41",
     "vue-router": "^4.6.4",

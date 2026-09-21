@@ -37,7 +37,7 @@ export default defineConfig({
     chunkSizeWarningLimit: 800,
   },
   server: {
-    port: 3000,
+    port: 4999,
     proxy: {
       '/api': 'http://127.0.0.1:8099',
     },

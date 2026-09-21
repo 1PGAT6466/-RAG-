@@ -47,7 +47,7 @@ def _ensure_table():
                 sources TEXT NOT NULL DEFAULT '[]',
                 hit_count INTEGER NOT NULL DEFAULT 0,
                 version INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
         # S14: 为 query 列创建索引，加速 hit_count UPDATE 语句
@@ -262,3 +262,38 @@ def _update_hit_count(query: str):
         conn.commit()
     except Exception:
         pass
+
+
+def purge_semantic_cache() -> int:
+    """#10（2026-09-21）：清理 semantic_cache 持久表，防无上限增长。
+
+    策略：保留 hit_count 最高的 SEMANTIC_CACHE_MAX 条（LRU-ish，与内存层口径一致），
+    其余删除。同时清理版本不一致的旧缓存（version != SEMANTIC_CACHE_VERSION）。
+    返回删除行数。
+    """
+    try:
+        _ensure_table()
+        from src.storage.db import _get_conn
+        conn = _get_conn()
+        removed = 0
+        # 1) 清旧版本缓存
+        cur = conn.execute(
+            "DELETE FROM semantic_cache WHERE version IS NULL OR version != ?",
+            (SEMANTIC_CACHE_VERSION,),
+        )
+        removed += cur.rowcount or 0
+        # 2) 超上限时保留 hit_count 最高的 N 条
+        total = conn.execute("SELECT COUNT(*) FROM semantic_cache").fetchone()[0]
+        if total > SEMANTIC_CACHE_MAX:
+            cur = conn.execute(
+                "DELETE FROM semantic_cache WHERE id NOT IN ("
+                "  SELECT id FROM semantic_cache ORDER BY hit_count DESC, created_at DESC LIMIT ?"
+                ")",
+                (SEMANTIC_CACHE_MAX,),
+            )
+            removed += cur.rowcount or 0
+        conn.commit()
+        return removed
+    except Exception as e:
+        logger.debug(f"semantic_cache 清理失败: {e}")
+        return 0

@@ -35,15 +35,34 @@ def _invalidate_penalty_cache():
 def add_feedback(user_id: int, kind: str, query: str = "",
                  chunk_ids: list = None, conversation_id: int = None,
                  message_id: int = None, comment: str = "") -> int:
-    """记录一条反馈。kind: 'up' | 'down'。返回新反馈 id。"""
+    """记录一条反馈。kind: 'up' | 'down'。返回反馈 id。
+
+    #22（2026-09-21）：幂等去重——同一 (user_id, kind, query, chunk_ids) 重复提交时
+    更新已有行（不新增），避免重复点踩被累加造成排序操纵。
+    """
     if kind not in ("up", "down"):
         kind = "down"
     conn = _get_conn()
+    cids_json = json.dumps(chunk_ids or [], ensure_ascii=False)
+    # 幂等：先查同键记录
+    existing = conn.execute(
+        "SELECT id FROM feedback WHERE user_id=? AND kind=? AND query=? AND chunk_ids=? "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id, kind, query, cids_json),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE feedback SET conversation_id=?, message_id=?, comment=?, "
+            "created_at=datetime('now') WHERE id=?",
+            (conversation_id, message_id, comment, existing["id"]),
+        )
+        conn.commit()
+        _invalidate_penalty_cache()
+        return existing["id"]
     cur = conn.execute(
         "INSERT INTO feedback (user_id, conversation_id, message_id, query, kind, chunk_ids, comment) "
         "VALUES (?,?,?,?,?,?,?)",
-        (user_id, conversation_id, message_id, query, kind,
-         json.dumps(chunk_ids or [], ensure_ascii=False), comment),
+        (user_id, conversation_id, message_id, query, kind, cids_json, comment),
     )
     conn.commit()
     _invalidate_penalty_cache()
@@ -67,14 +86,16 @@ def remove_feedback(user_id: int, kind: str, query: str = "",
 
 
 def _parse_feedback_time(s: str, now: float = None) -> float:
-    """把 feedback.created_at（'YYYY-MM-DD HH:MM:SS' localtime）解析成 epoch 秒。
+    """把 feedback.created_at（'YYYY-MM-DD HH:MM:SS' UTC）解析成 epoch 秒。
 
+    #2（2026-09-21）：时间戳已统一为 UTC 存储，故按 UTC 解释。
     解析失败返回 now（视为刚发生，不做衰减）——避免乱七八糟的时间戳导致惩罚异常。
     """
     if now is None:
         now = time.time()
     try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        from datetime import timezone
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except Exception:
         return now

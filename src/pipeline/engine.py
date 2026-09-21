@@ -195,11 +195,21 @@ def enqueue(filepath: str, filename: str = None) -> str:
 
 
 def _run_with_limit(task_id: str):
+    """后台/线程池摄取入口。
+
+    #7（2026-09-21）：每个后台线程结束时关闭其 thread-local SQLite 连接，
+    避免摄取线程常驻连接累积（原 close_thread_conn 定义但全仓零调用）。
+    """
     _ingest_semaphore.acquire()
     try:
         _run(task_id)
     finally:
         _ingest_semaphore.release()
+        try:
+            from src.storage.db import close_thread_conn
+            close_thread_conn()
+        except Exception:
+            pass
 
 
 def get_status(task_id: str) -> Optional[dict]:
@@ -580,6 +590,13 @@ def _start_retry_scheduler():
                 _process_retry_queue()
             except Exception as e:
                 logger.warning(f"[引擎] 重试调度器异常（已忽略）: {e}")
+            finally:
+                # #7：定期释放本线程的 thread-local 连接，防长期驻留
+                try:
+                    from src.storage.db import close_thread_conn
+                    close_thread_conn()
+                except Exception:
+                    pass
 
     t = threading.Thread(target=_scheduler_loop, daemon=True, name="retry-scheduler")
     t.start()

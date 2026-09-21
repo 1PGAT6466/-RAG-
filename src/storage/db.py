@@ -21,6 +21,7 @@ from src.storage.files import (
 # Chunk + FTS5 搜索 + 链接
 from src.storage.chunks import (
     add_chunks_batch, get_chunks_by_file, fts_search, add_link, get_graph_data, get_file_backlinks,
+    reconcile_fts,
 )
 # 实体/关系/图谱
 from src.storage.entities import (

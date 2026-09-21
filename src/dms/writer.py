@@ -108,8 +108,9 @@ def _folder_list_string(path_ids: list[int]) -> str:
 
 
 def create_document(conn: sqlite3.Connection, folder_id: int, filename: str,
-                    content: bytes, owner_id: int = 1,
-                    comment: str = "", keywords: str = "") -> int:
+                    content: bytes = None, owner_id: int = 1,
+                    comment: str = "", keywords: str = "",
+                    content_path: str = None) -> int:
     """在 SeedDMS 中创建文档（含首个版本），返回新 document_id。
 
     严格复刻 SeedDMS Folder::addDocument + Document::addContent 的写库顺序：
@@ -118,6 +119,10 @@ def create_document(conn: sqlite3.Connection, folder_id: int, filename: str,
       3. tblDocumentContent 插入（dir="<docId>/", checksum=md5）
       4. tblDocumentStatus + tblDocumentStatusLog（S_RELEASED）
 
+    #23（2026-09-21）：支持 content_path 流式写入（大文件不再全量驻留内存）。
+      - content（bytes）：兼容旧调用；
+      - content_path（str）：分块读临时文件 → 流式落盘 + 增量 md5，内存峰值降到块大小。
+
     返回新文档 id。失败抛 SeedDMSWriteError 并回滚。
     """
     # 校验目标文件夹存在
@@ -125,10 +130,33 @@ def create_document(conn: sqlite3.Connection, folder_id: int, filename: str,
     if not path_ids or path_ids[-1] != folder_id:
         raise SeedDMSWriteError(f"目标文件夹不存在: id={folder_id}")
 
+    if content is None and content_path is None:
+        raise SeedDMSWriteError("create_document 需提供 content 或 content_path")
+
     mime, ext = _detect_mime_and_ext(filename)
     now_ts = int(time.time())
-    file_size = len(content)
-    checksum = hashlib.md5(content).hexdigest()  # SeedDMS 用 md5（32位小写 hex）
+
+    def _stream_copy_and_hash(src_path: str, dest_path: Path):
+        """分块拷贝 + 增量 md5，返回 (size, md5_hex)。"""
+        md5 = hashlib.md5()
+        size = 0
+        with open(src_path, "rb") as rf, open(dest_path, "wb") as wf:
+            while True:
+                buf = rf.read(4 * 1024 * 1024)
+                if not buf:
+                    break
+                wf.write(buf)
+                md5.update(buf)
+                size += len(buf)
+        return size, md5.hexdigest()
+
+    if content is not None:
+        file_size = len(content)
+        checksum = hashlib.md5(content).hexdigest()  # SeedDMS 用 md5（32位小写 hex）
+    else:
+        # 惰性：落盘时才计算（下方 _stream_copy_and_hash）
+        file_size = None
+        checksum = None
 
     # SeedDMS 约定：tblDocuments.name 存「不含扩展名」的文档名，下载时用 name + fileType 拼接。
     # 若 name 已含扩展名，REST 下载 /restapi/document/{id}/content 的 filename 会重复（x.txt.txt）。
@@ -157,7 +185,11 @@ def create_document(conn: sqlite3.Connection, folder_id: int, filename: str,
         doc_dir.mkdir(parents=True, exist_ok=True)
         version = 1
         dest = doc_dir / f"{version}{ext}"
-        dest.write_bytes(content)
+        if content is not None:
+            dest.write_bytes(content)
+        else:
+            # #23：流式落盘 + 增量 md5，避免大文件全量驻留内存
+            file_size, checksum = _stream_copy_and_hash(content_path, dest)
 
         # 3) 版本内容记录（dir 是 "<docId>/"，SeedDMS getDir() 返回）
         dir_field = f"{doc_id}/"
@@ -212,15 +244,18 @@ def create_document(conn: sqlite3.Connection, folder_id: int, filename: str,
         raise
 
 
-def upload_document(folder_id: int, filename: str, content: bytes,
+def upload_document(folder_id: int, filename: str, content: bytes = None,
                     owner_id: int = 1, comment: str = "",
-                    keywords: str = "") -> int:
-    """浏览器上传入口：写入 SeedDMS 并返回新 document_id。"""
+                    keywords: str = "", content_path: str = None) -> int:
+    """浏览器上传入口：写入 SeedDMS 并返回新 document_id。
+
+    #23：content（bytes）与 content_path（临时文件路径）二选一，后者流式落盘。
+    """
     conn = get_dms_conn()
     try:
         return create_document(conn, folder_id, filename, content,
                                owner_id=owner_id, comment=comment,
-                               keywords=keywords)
+                               keywords=keywords, content_path=content_path)
     finally:
         conn.close()
 

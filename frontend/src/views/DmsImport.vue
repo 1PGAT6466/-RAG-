@@ -99,7 +99,12 @@
                 <p v-if="!docListError" class="tree-empty-hint">尝试切换上方「未导入/已导入」筛选，或点击右上角「刷新」。</p>
               </div>
               <div v-for="d in docList" :key="d.id" class="doc-list-item">
-                <div class="doc-list-name" :title="d.name">{{ d.name }}</div>
+                <div class="doc-list-row">
+                  <div class="doc-list-name" :title="d.name">{{ d.name }}</div>
+                  <el-button v-if="canPreviewDoc(d)" size="small" type="primary" text @click.stop="openDmsPreview(d)">
+                    预览
+                  </el-button>
+                </div>
                 <div class="doc-list-meta">
                   <span class="doc-list-folder">{{ d.folder_path }}</span>
                   <el-tag :type="d.imported ? 'success' : 'info'" size="small" effect="plain">
@@ -243,6 +248,14 @@
         <el-button type="primary" :loading="savingConn" @click="saveConnConfig">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- DMS 文档预览 -->
+    <FilePreview
+      v-model="previewVisible"
+      :dms-doc-id="previewDoc?.id"
+      :dms-file-name="previewDoc?.name"
+      :dms-ext="previewDoc?.ext"
+    />
   </div>
 </template>
 
@@ -251,6 +264,7 @@ import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import dmsApi from '../api/dms'
 import PageBack from '../components/PageBack.vue'
+import FilePreview from '../components/FilePreview.vue'
 
 const loading = ref(false)
 const importing = ref(false)
@@ -262,6 +276,10 @@ const records = ref([])
 const importResult = ref(null)
 const selectAllFolder = ref(false)
 const treeRef = ref(null)
+
+// 文件预览
+const previewVisible = ref(false)
+const previewDoc = ref(null)  // { id, name, type }
 
 // 左侧 Tab + 文档列表分页
 const leftTab = ref('folder')
@@ -512,6 +530,19 @@ function openDmsWeb() {
   window.open(base + '/out/out.Login.php', '_blank', 'noopener,noreferrer')
 }
 
+// 文件预览
+const PREVIEW_EXTS = ['pdf', 'docx', 'xlsx', 'xls']
+function canPreviewDoc(d) {
+  if (!d || !d.name) return false
+  const ext = d.name.split('.').pop().toLowerCase()
+  return PREVIEW_EXTS.includes(ext)
+}
+function openDmsPreview(d) {
+  const ext = d.name.split('.').pop().toLowerCase()
+  previewDoc.value = { id: d.id, name: d.name, ext }
+  previewVisible.value = true
+}
+
 async function doImport() {
   const checked = treeRef.value?.getCheckedNodes(true) || []
   const docIds = checked.filter(n => n.type === 'document').map(n => n.id)
@@ -664,6 +695,13 @@ onMounted(async () => {
   border-bottom: 1px dashed var(--border);
 }
 .doc-list-item:hover { background: var(--bg-subtle, #f5f6f8); }
+.doc-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.doc-list-row .doc-list-name { flex: 1; min-width: 0; }
 .doc-list-name {
   font-size: 13px;
   font-weight: 500;

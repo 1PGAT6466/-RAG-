@@ -66,7 +66,7 @@ def add_conversation_message(conversation_id: int, role: str, content: str,
         (conversation_id, role, content, mode, json.dumps(sources or [], ensure_ascii=False)),
     )
     conn.execute(
-        "UPDATE conversations SET updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE conversations SET updated_at=datetime('now') WHERE id=?",
         (conversation_id,),
     )
     conn.commit()
@@ -76,7 +76,7 @@ def add_conversation_message(conversation_id: int, role: str, content: str,
 def update_conversation_title(conversation_id: int, title: str):
     conn = _get_conn()
     conn.execute(
-        "UPDATE conversations SET title=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE conversations SET title=?, updated_at=datetime('now') WHERE id=?",
         (title, conversation_id),
     )
     conn.commit()

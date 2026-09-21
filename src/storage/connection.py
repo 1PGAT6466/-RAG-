@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS files (
     folder TEXT NOT NULL DEFAULT '/',
     summary TEXT NOT NULL DEFAULT '',
     chunk_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     token_count INTEGER NOT NULL DEFAULT 0,
     embedding BLOB,
     metadata TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS links (
     link_type TEXT NOT NULL DEFAULT 'keyword',
     weight REAL NOT NULL DEFAULT 1.0,
     context TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(source_id, target_id, link_type)
 );
 CREATE TABLE IF NOT EXISTS users (
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(content, tokenize='unicode61');
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_tri USING fts5(content, tokenize='trigram');
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS entities (
     aliases TEXT NOT NULL DEFAULT '[]',
     description TEXT NOT NULL DEFAULT '',
     attributes TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(name, type)
 );
 CREATE TABLE IF NOT EXISTS entity_chunks (
@@ -101,8 +101,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     title TEXT NOT NULL DEFAULT '新对话',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     content TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'knowledge',
     sources TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
 CREATE INDEX IF NOT EXISTS idx_conv_msg_conv ON conversation_messages(conversation_id);
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     kind TEXT NOT NULL DEFAULT 'down',
     chunk_ids TEXT NOT NULL DEFAULT '[]',
     comment TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_chunk ON feedback(kind);
@@ -160,8 +160,8 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
     status TEXT NOT NULL DEFAULT 'draft',
     compiled_by TEXT NOT NULL DEFAULT 'llm',
     version INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_wiki_cat ON wiki_pages(category);
 CREATE INDEX IF NOT EXISTS idx_wiki_status ON wiki_pages(status);
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS wiki_links (
     from_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
     to_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
     link_type TEXT NOT NULL DEFAULT 'wiki',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(from_page_id, to_page_id, link_type)
 );
 CREATE TABLE IF NOT EXISTS wiki_versions (
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS wiki_versions (
     content_md TEXT NOT NULL,
     changed_by TEXT NOT NULL DEFAULT 'llm',
     note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS dms_imports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS dms_imports (
     dms_folder_path TEXT NOT NULL DEFAULT '',
     dms_name TEXT NOT NULL DEFAULT '',
     content_hash TEXT NOT NULL DEFAULT '',
-    imported_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    imported_at TEXT NOT NULL DEFAULT (datetime('now')),
     status TEXT NOT NULL DEFAULT 'imported',
     UNIQUE(dms_doc_id)
 );
@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS file_permissions (
     user_id INTEGER,
     role TEXT,
     permission TEXT NOT NULL DEFAULT 'read',
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_fp_file ON file_permissions(file_id);
 CREATE INDEX IF NOT EXISTS idx_fp_user ON file_permissions(user_id);
@@ -237,20 +237,24 @@ CREATE TABLE IF NOT EXISTS semantic_cache (
     sources TEXT NOT NULL DEFAULT '[]',
     embedding BLOB,
     hit_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     last_hit_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sc_hash ON semantic_cache(query_hash);
 
 -- S8: Rerank 缓存表
+-- 缺陷A 修复（2026-09-21）：此表曾与 rerank.py 的惰性建表定义冲突
+--   （旧：fingerprint/query/results 无主键；新：q/top_k/fp/results_json 复合主键），
+--   导致 rerank.py 的 CREATE TABLE IF NOT EXISTS 静默 no-op、所有读写报错被吞，
+--   持久缓存从未生效（实测 0 行）。现以此处为唯一权威定义，与 rerank.py 代码对齐。
 CREATE TABLE IF NOT EXISTS rerank_cache (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint TEXT NOT NULL,
-    query TEXT NOT NULL,
-    results TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    q TEXT NOT NULL,
+    top_k INTEGER NOT NULL,
+    fp TEXT NOT NULL,
+    results_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (q, top_k, fp)
 );
-CREATE INDEX IF NOT EXISTS idx_rc_fp ON rerank_cache(fingerprint);
 
 -- 审计日志表
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -262,7 +266,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     target_id INTEGER,
     detail TEXT,
     ip TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
@@ -270,7 +274,19 @@ CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
 
 
 def _new_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return make_conn(DB_PATH)
+
+
+def make_conn(db_path: str) -> sqlite3.Connection:
+    """#3（2026-09-21）：统一 SQLite 连接工厂。
+
+    供除主库 rag.db 外的其他 SQLite 库（如 plugins.db）复用同一套 PRAGMA 配置
+    （WAL + foreign_keys + busy_timeout），避免各处自建连接导致口径不一。
+
+    注意：本函数只负责「建连接 + 配置 PRAGMA」，不负责 thread-local / contextvar
+    缓存。调用方自行管理连接生命周期（建议配合 close_thread_conn 语义）。
+    """
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -345,7 +361,99 @@ def init_db():
     _migrate_add_column(conn, "files", "content_hash", "TEXT DEFAULT NULL")
     # P23: 回收站（软删除）
     _migrate_add_column(conn, "files", "deleted_at", "TEXT DEFAULT NULL")
+    # 缺陷A 修复：重建历史遗留的 rerank_cache 旧结构（fingerprint/query/results）
+    _repair_rerank_cache(conn)
+    # #1 迁移收敛：自动应用 migrations/ 下待执行的版本化迁移并维护 schema_version
+    _apply_pending_migrations(conn)
     conn.commit()
+
+
+def _apply_pending_migrations(conn):
+    """#1（2026-09-21）：让 init_db 与 migrations/ 版本框架收敛为一条通道。
+
+    背景：项目存在两套 schema 演进机制——init_db 的内联 SCHEMA + _migrate_add_column，
+    与 migrations/ + scripts/migrate.py（带 schema_version 表），init_db 不维护
+    schema_version，两套会漂移。
+
+    本函数在启动时自动执行 pending 迁移并回写 schema_version，使「启动即同步」。
+    与 scripts/migrate.py 逻辑一致（up 函数 / UP_SQL 两种形式），幂等可重复执行。
+    迁移目录不存在或无 pending 时静默返回（不阻塞启动）。
+    """
+    import importlib.util
+    from pathlib import Path
+    mig_dir = Path(__file__).parent.parent.parent / "migrations"
+    if not mig_dir.exists():
+        return
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        current = row[0] if row and row[0] is not None else 0
+        pending = []
+        for f in sorted(mig_dir.glob("*.py")):
+            parts = f.stem.split("_", 1)
+            if len(parts) >= 2 and parts[0].isdigit() and int(parts[0]) > current:
+                pending.append((int(parts[0]), parts[1], f))
+        if not pending:
+            return
+        for version, name, path in sorted(pending, key=lambda x: x[0]):
+            try:
+                spec = importlib.util.spec_from_file_location(f"mig_{version}", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "up"):
+                    mod.up(conn)
+                elif hasattr(mod, "UP"):
+                    conn.executescript(mod.UP)
+                elif hasattr(mod, "UP_SQL"):
+                    conn.executescript(mod.UP_SQL)
+                else:
+                    logger.warning(f"迁移 {version:03d} {name} 无 up/UP/UP_SQL，跳过")
+                    continue
+                conn.execute(
+                    "INSERT INTO schema_version (version, name) VALUES (?, ?)",
+                    (version, name),
+                )
+                conn.commit()
+                logger.warning(f"迁移：已应用 {version:03d} {name}")
+            except Exception as e:
+                logger.error(f"迁移 {version:03d} {name} 失败：{e}")
+                conn.rollback()
+    except Exception as e:
+        logger.error(f"自动迁移执行失败（不阻塞启动）：{e}")
+
+
+def _repair_rerank_cache(conn):
+    """缺陷A（2026-09-21）：旧版 rerank_cache 结构（fingerprint/query/results）与
+    rerank.py 代码使用的（q/top_k/fp/results_json）不一致，导致持久缓存静默失效。
+
+    旧表无有效数据（缓存可重建），检测到旧结构直接 DROP 重建为新结构。
+    """
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(rerank_cache)").fetchall()}
+    except Exception:
+        return
+    if not cols:
+        return  # 表不存在，SCHEMA 已建好
+    if "results_json" in cols:
+        return  # 已是新结构
+    conn.execute("DROP TABLE IF EXISTS rerank_cache")
+    conn.execute("""
+        CREATE TABLE rerank_cache (
+            q TEXT NOT NULL,
+            top_k INTEGER NOT NULL,
+            fp TEXT NOT NULL,
+            results_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (q, top_k, fp)
+        )
+    """)
+    logger.warning("迁移：rerank_cache 旧结构已重建为新结构（缺陷A 修复）")
 
 
 def _migrate_add_column(conn, table: str, column: str, ddl: str):

@@ -11,6 +11,13 @@ data/
 *.log
 logs/
 
+# === 备份目录（#25：不提交，保留最近 1-2 份，其余归档到备份盘） ===
+_backup_before_*/
+backups/
+_archive/
+*.bak
+*.bak_*
+
 # === Python ===
 __pycache__/
 *.py[cod]

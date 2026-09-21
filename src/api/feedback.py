@@ -6,10 +6,16 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 
 from src.auth.deps import get_current_user
+from src.auth.rate_limit import RateLimiter
+from src.api.errors import BizError, ErrorCode
 from src.storage.feedback import add_feedback, remove_feedback
 
 logger = logging.getLogger("rag.api.feedback")
 router = APIRouter()
+
+# #22（2026-09-21）：feedback 写接口限流（per-user，1 分钟 ≤30 次）。
+# 开启反馈反哺检索后，无限制的写接口存在排序操纵面，故加流控 + 幂等去重。
+_feedback_limiter = RateLimiter(max_requests=30, window_seconds=60)
 
 
 class FeedbackReq(BaseModel):
@@ -27,6 +33,9 @@ def api_add_feedback(req: FeedbackReq, user=Depends(get_current_user)):
     chunk_ids 为本次回答引用的 chunk id 列表（供阶段二按 chunk 聚合惩罚用）。
     """
     user_id = user.get("user_id")
+    # #22：per-user 限流
+    if not _feedback_limiter.allow(f"fb:{user_id}"):
+        raise BizError(ErrorCode.RATE_LIMITED, "反馈过于频繁，请稍后重试")
     # 归一化 chunk_ids：字段来自 sources.chunk_id / 结果 id，可能混入字符串
     cids = []
     for c in req.chunk_ids:
@@ -46,6 +55,9 @@ def api_remove_feedback(kind: str, query: str = "", chunk_ids: str = "[]",
     # S8: kind 参数校验（只能是 up/down）
     if not _re.match(r'^(up|down)$', kind):
         raise HTTPException(status_code=400, detail="kind 参数只能是 up 或 down")
+    # #22：per-user 限流
+    if not _feedback_limiter.allow(f"fb:{user.get('user_id')}"):
+        raise BizError(ErrorCode.RATE_LIMITED, "反馈过于频繁，请稍后重试")
     try:
         cids = _json.loads(chunk_ids or "[]")
     except Exception:

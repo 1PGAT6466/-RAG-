@@ -76,6 +76,17 @@ class TestReasoningModelTokens:
         assert result > 1024
 
     def test_deepseek_normal_budget(self):
+        # DeepSeek v4 系列也是推理模型（有 reasoning_content），实现会抬到 2048 下限，
+        # 避免 1024 预算被思维链耗尽导致 content 截空。原断言 ==1024 与实现脱节，已同步。
         from src.llm_client import _reasoning_model_tokens
         result = _reasoning_model_tokens("deepseek-flash", 1024)
-        assert result == 1024
+        assert result == 2048
+
+    def test_deepseek_budget_not_lowered(self):
+        """预算只会抬升，不会压低显式传入的大值。"""
+        from src.llm_client import _reasoning_model_tokens
+        assert _reasoning_model_tokens("deepseek-flash", 8000) == 8000
+
+    def test_non_reasoning_budget_untouched(self):
+        from src.llm_client import _reasoning_model_tokens
+        assert _reasoning_model_tokens("gpt-4o", 1024) == 1024

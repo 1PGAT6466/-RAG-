@@ -1,4 +1,4 @@
-﻿"""
+"""
 rerank.py — Rerank 精排降级链（移植自 RAG伏羲 src/taiyang/rerank.py）
 
 优先级（三级降级）：
@@ -17,6 +17,7 @@ import logging
 import time
 import threading
 from collections import OrderedDict
+from datetime import datetime
 
 import httpx
 
@@ -129,11 +130,16 @@ async def rerank_with_deepseek(query, candidates, top_k=30):
     scored = []
     for i, r in enumerate(candidates):
         rr = dict(r)
-        rr["_rerank_score"] = round(scores[i], 4)
+        raw = scores[i]
+        # #11（2026-09-21）：统一打分刻度。DeepSeek 返回 0-10，归一化到 0-1，
+        # 与 SiliconFlow（BGE-Reranker relevance_score 本就 0-1）对齐，
+        # 避免不同降级路径下 score 量纲不一致导致排序跳变。
+        norm = max(0.0, min(1.0, raw / 10.0))
+        rr["_rerank_score"] = round(norm, 4)
         rr["_rerank_source"] = "deepseek"
         rr["_pre_rerank_score"] = rr.get("score", 0)
-        rr["score"] = round(scores[i], 4)  # 与 SiliconFlow 路径一致：rerank 分写入主字段
-        scored.append((scores[i], rr))
+        rr["score"] = round(norm, 4)
+        scored.append((norm, rr))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [r for _, r in scored[:top_k]]
 
@@ -163,6 +169,16 @@ def rerank_local(query, candidates, top_k=30):
     # 提前 lower 一次，避免循环内对每个 token 重复 .lower()
     tokens = [t.lower() for t in tokens]
 
+    # #11（2026-09-21）：改为词边界匹配（jieba 分词后按 token 集合匹配），
+    # 避免子串误命中（如查询 token「镀金」命中文本里的「镀金层」）。
+    def _tokenize_doc(doc_text: str) -> list:
+        try:
+            import jieba
+            return [t.lower() for t in jieba.cut_for_search(doc_text) if t.strip()]
+        except ImportError:
+            return doc_text.split()
+
+    from collections import Counter
     scored = []
     raw_scores = []
     for r in candidates:
@@ -171,13 +187,26 @@ def rerank_local(query, candidates, top_k=30):
             scored.append((r.get("score", 0), r, 0.0))
             raw_scores.append(0.0)
             continue
+        doc_tokens = _tokenize_doc(text)
+        if not doc_tokens:
+            scored.append((r.get("score", 0), r, 0.0))
+            raw_scores.append(0.0)
+            continue
+        doc_counter = Counter(doc_tokens)
+        doc_token_set = set(doc_tokens)
+        doc_len = max(len(doc_tokens), 1)
         score = 0.0
-        text_len = max(len(text), 1)
         for t in tokens:
-            count = text.count(t)
-            score += count / text_len * 1000
-            if count:
+            if t in doc_token_set:
+                # 词边界命中：t 作为完整 token 出现
+                score += doc_counter[t] / doc_len * 1000
                 score += 5
+            elif len(t) >= 2:
+                # 降级：t 是某个文档 token 的真子串时给半权重（保留 CJK 未登录词召回）
+                for dt in doc_token_set:
+                    if t != dt and t in dt:
+                        score += 2.5
+                        break
         raw_scores.append(score)
         scored.append((0, r, score))
 
@@ -221,7 +250,8 @@ async def rerank(query, candidates, top_k=30):
     fp = _candidate_fingerprint(candidates)
 
     # 结果级缓存（两级：内存 LRU + SQLite 持久化）
-    cache_key = (query, top_k, fp)
+    # #14（2026-09-21）：query 归一化（strip/lower/全半角/空白折叠），避免大小写标点差异 miss
+    cache_key = (_normalize_query(query), top_k, fp)
     cached = _rerank_cache_get(cache_key)
     if cached is not None:
         logger.info(f"[Rerank] 缓存命中(内存): query='{query[:30]}'")
@@ -255,7 +285,8 @@ async def rerank(query, candidates, top_k=30):
 _rerank_cache: OrderedDict = OrderedDict()  # key -> (ts, results)
 _rerank_cache_lock = threading.Lock()
 _RERANK_CACHE_MAX = 512
-_RERANK_CACHE_TTL = 300  # 秒
+_RERANK_CACHE_TTL = 300  # 秒（内存层）
+_RERANK_DB_CACHE_TTL = 24 * 3600  # 秒（SQLite 持久层，#8：24h 过期）
 
 
 def _rerank_cache_get(key):
@@ -298,6 +329,29 @@ def _candidate_fingerprint(candidates: list[dict]) -> str:
     return hashlib.md5(joined.encode()).hexdigest()[:12]
 
 
+def _normalize_query(query: str) -> str:
+    """#14（2026-09-21）：rerank 缓存 key 的 query 归一化。
+
+    统一 strip → 全角转半角 → 小写 → 空白折叠，使「镀金  层」、「镀金层」、
+    「ＡＢＣ」/「abc」等语义相同的查询共享缓存条目，降低 miss 率。
+    """
+    if not query:
+        return ""
+    q = str(query).strip()
+    # 全角字符（U+FF01–U+FF5E）转半角；全角空格 U+3000 转普通空格
+    out = []
+    for ch in q:
+        code = ord(ch)
+        if 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - 0xFEE0))
+        elif code == 0x3000:
+            out.append(" ")
+        else:
+            out.append(ch)
+    q = "".join(out).lower()
+    return re.sub(r"\s+", " ", q).strip()
+
+
 def _reorder_by_seq(candidates: list[dict], seq: list[dict], top_k: int) -> list[dict]:
     """用持久化缓存的排序序列表（id+score）重排当次 candidates。
 
@@ -328,18 +382,16 @@ def _reorder_by_seq(candidates: list[dict], seq: list[dict], top_k: int) -> list
 
 
 def _rerank_cache_db_ensure_table():
+    """确保表存在。
+
+    缺陷A（2026-09-21）：此处曾有与 connection.py SCHEMA 冲突的建表定义
+    （q/top_k/fp/results_json），因表已存在而静默 no-op。现统一以
+    `src.storage.connection.SCHEMA` 为唯一权威定义，本函数仅保留作为兜底。
+    """
+    from src.storage.connection import SCHEMA
     from src.storage.db import _get_conn
     conn = _get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS rerank_cache (
-            q TEXT NOT NULL,
-            top_k INTEGER NOT NULL,
-            fp TEXT NOT NULL,
-            results_json TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-            PRIMARY KEY (q, top_k, fp)
-        )
-    """)
+    conn.executescript(SCHEMA)
     conn.commit()
 
 
@@ -362,19 +414,63 @@ def _rerank_cache_db_set(key, results):
 
 def _rerank_cache_db_get(key) -> list | None:
     """读取持久化缓存，返回排序序列表（id+score）。
-    返回的是「排序元数据」，调用方据此重排当次的 candidates（保证内容实时）。"""
+    返回的是「排序元数据」，调用方据此重排当次的 candidates（保证内容实时）。
+
+    #8（2026-09-21）：增加 TTL 校验。旧实现无过期，候选集不变时排序永久冻结
+    （新反馈惩罚 / 权限变化不会反映）。超 TTL 视为 miss 并顺手删除该行。
+    """
     import json as _json
     q, top_k, fp = key
     try:
         from src.storage.db import _get_conn
         conn = _get_conn()
         row = conn.execute(
-            "SELECT results_json FROM rerank_cache WHERE q=? AND top_k=? AND fp=?",
+            "SELECT results_json, created_at FROM rerank_cache WHERE q=? AND top_k=? AND fp=?",
             (q, top_k, fp)
         ).fetchone()
         if not row:
+            return None
+        if _rerank_db_row_expired(row["created_at"]):
+            conn.execute(
+                "DELETE FROM rerank_cache WHERE q=? AND top_k=? AND fp=?", (q, top_k, fp)
+            )
+            conn.commit()
             return None
         return _json.loads(row["results_json"])
     except Exception as e:
         logger.debug(f"rerank 持久化缓存读取失败: {e}")
         return None
+
+
+def _rerank_db_row_expired(created_at: str | None) -> bool:
+    """判断持久缓存行是否超过 TTL。
+
+    #2（2026-09-21）：created_at 已统一为 UTC（SQLite `datetime('now')`），
+    故按 UTC 解释后与当前 epoch 对比。
+    """
+    if not created_at:
+        return False
+    try:
+        from datetime import timezone
+        ts = datetime.strptime(str(created_at), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except (ValueError, TypeError):
+        return False
+    return (time.time() - ts) > _RERANK_DB_CACHE_TTL
+
+
+def purge_expired_rerank_cache() -> int:
+    """清理持久缓存中过期的行（供启动 / 每日任务调用）。返回删除行数。"""
+    try:
+        from src.storage.db import _get_conn
+        conn = _get_conn()
+        cutoff = datetime.utcfromtimestamp(time.time() - _RERANK_DB_CACHE_TTL).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        cur = conn.execute("DELETE FROM rerank_cache WHERE created_at < ?", (cutoff,))
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception as e:
+        logger.debug(f"rerank 持久缓存清理失败: {e}")
+        return 0

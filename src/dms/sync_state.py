@@ -47,7 +47,7 @@ def upsert_import_record(dms_doc_id: int, file_id: int, dms_version: int,
         """
         INSERT INTO dms_imports (file_id, dms_doc_id, dms_version, dms_folder_path,
                                  dms_name, content_hash, status, imported_at)
-        VALUES (?,?,?,?,?,?,?,datetime('now','localtime'))
+        VALUES (?,?,?,?,?,?,?,datetime('now'))
         ON CONFLICT(dms_doc_id) DO UPDATE SET
             file_id=excluded.file_id,
             dms_version=excluded.dms_version,
@@ -55,7 +55,7 @@ def upsert_import_record(dms_doc_id: int, file_id: int, dms_version: int,
             dms_name=excluded.dms_name,
             content_hash=excluded.content_hash,
             status=excluded.status,
-            imported_at=datetime('now','localtime')
+            imported_at=datetime('now')
         """,
         (file_id, dms_doc_id, dms_version, dms_folder_path, dms_name, content_hash, status),
     )

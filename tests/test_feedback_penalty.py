@@ -22,9 +22,10 @@ import pytest
 import src.storage.feedback as fb
 
 
-# 用本地时间戳保持一致（feedback.created_at 是 localtime 字符串，_parse_feedback_time 按本地解析）
-def _localtime_ts(s: str) -> float:
-    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+# 用 UTC 时间戳保持一致（feedback.created_at 是 UTC 字符串，_parse_feedback_time 按 UTC 解析）
+def _utc_ts(s: str) -> float:
+    from datetime import timezone
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
 
 
 @pytest.fixture
@@ -43,7 +44,7 @@ def tmp_conn(tmp_path, monkeypatch):
             kind TEXT NOT NULL DEFAULT 'down',
             chunk_ids TEXT NOT NULL DEFAULT '[]',
             comment TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
@@ -67,7 +68,7 @@ class TestChunkPenalties:
     def test_threshold_not_met_no_penalty(self, tmp_conn):
         # 单次点踩，有效点踩=1.0 < threshold=2.0 → 不惩罚
         _insert(tmp_conn, [100], "2026-09-08 10:00:00")
-        now = _localtime_ts("2026-09-08 10:00:00")
+        now = _utc_ts("2026-09-08 10:00:00")
         pen = fb.get_chunk_penalties({100}, half_life_days=7.0, threshold=2.0, alpha=0.5, now=now)
         assert 100 not in pen  # 未达阈值，不返回（默认 1.0 不惩罚）
 
@@ -75,7 +76,7 @@ class TestChunkPenalties:
         # 3 次点踩（同一 chunk），有效点踩=3.0 ≥ 2.0 → 惩罚
         for _ in range(3):
             _insert(tmp_conn, [200], "2026-09-08 10:00:00")
-        now = _localtime_ts("2026-09-08 10:00:00")
+        now = _utc_ts("2026-09-08 10:00:00")
         pen = fb.get_chunk_penalties({200}, half_life_days=7.0, threshold=2.0, alpha=0.5, now=now)
         assert 200 in pen
         # penalty = 1/(1+0.5*3) = 1/2.5 = 0.4
@@ -85,17 +86,20 @@ class TestChunkPenalties:
         # 理论验证：penalty = 1/(1+alpha*eff)
         _insert(tmp_conn, [300], "2026-09-08 10:00:00")
         _insert(tmp_conn, [300], "2026-09-08 10:00:00")  # eff=2.0
-        now = _localtime_ts("2026-09-08 10:00:00")
+        now = _utc_ts("2026-09-08 10:00:00")
         pen = fb.get_chunk_penalties({300}, half_life_days=7.0, threshold=2.0, alpha=0.5, now=now)
         # eff=2.0, alpha=0.5 → penalty=1/(1+1.0)=0.5
         assert abs(pen[300] - 0.5) < 1e-3
 
     def test_half_life_decay(self, tmp_conn):
         # 半衰期验证：一条半衰期前的点踩，影响减半。
-        now = _localtime_ts("2026-09-08 10:00:00")
+        now = _utc_ts("2026-09-08 10:00:00")
         half_life = 7 * 86400.0
         t_old = now - half_life
         t_old_str = datetime.fromtimestamp(t_old).strftime("%Y-%m-%d %H:%M:%S")
+        # #2：created_at 已统一为 UTC，格式化也要用 UTC（否则差一个时区偏移）
+        from datetime import timezone as _tz
+        t_old_str = datetime.fromtimestamp(t_old, tz=_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
         # 插 3 条：2 条「现在」（各衰减 1.0）+ 1 条「7 天前」（衰减 0.5）
         _insert(tmp_conn, [400], "2026-09-08 10:00:00")
         _insert(tmp_conn, [400], "2026-09-08 10:00:00")
@@ -109,7 +113,7 @@ class TestChunkPenalties:
         for _ in range(3):
             _insert(tmp_conn, [500], "2026-09-08 10:00:00")
             _insert(tmp_conn, [600], "2026-09-08 10:00:00")
-        now = _localtime_ts("2026-09-08 10:00:00")
+        now = _utc_ts("2026-09-08 10:00:00")
         pen = fb.get_chunk_penalties({500}, half_life_days=7.0, threshold=2.0, alpha=0.5, now=now)
         assert 500 in pen
         assert 600 not in pen  # 不在候选集合，不查询/不返回

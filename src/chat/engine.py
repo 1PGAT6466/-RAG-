@@ -45,6 +45,26 @@ SYSTEM_PROMPT_CHAT = """你是「伏羲」，一个温暖、有个性的工业�
 #   避免历史「6 条 vs 20 条」两套截止口径不一致导致的多轮连续性差异）。
 CHAT_HISTORY_LIMIT = 20
 
+# #12（2026-09-21）：历史字符预算上限。超过时按「滑窗」从最旧开始丢弃，
+#   避免长对话上下文膨胀/成本翻倍。「条数」与「字符预算」双约束取更小者。
+CHAT_HISTORY_CHAR_BUDGET = 12000
+
+
+def _trim_history(history: list[dict]) -> list[dict]:
+    """历史裁剪：先按条数截尾，再按字符预算滑窗丢弃最旧消息。
+
+    #12：两级治理的第一级（零成本、确定性）。保留最近的消息，保证多轮连续性；
+    超预算时从最旧开始删，直到满足预算或只剩最后一条。
+    """
+    if not history:
+        return []
+    msgs = list(history[-CHAT_HISTORY_LIMIT:])
+    total = sum(len(str(m.get("content", ""))) for m in msgs)
+    while len(msgs) > 1 and total > CHAT_HISTORY_CHAR_BUDGET:
+        dropped = msgs.pop(0)
+        total -= len(str(dropped.get("content", "")))
+    return msgs
+
 
 def _build_reference_context(chunks: list[dict], max_chunk_chars: int = 800,
                              max_total_chars: int = 6000) -> tuple[str, list[dict]]:
@@ -137,7 +157,8 @@ async def generate_chat(query: str, history: list[dict] = None) -> str:
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
     if history:
-        messages.extend(history[-CHAT_HISTORY_LIMIT:])
+        # #12：字符预算滑窗（先条数截尾，再按字符预算丢弃最旧）
+        messages.extend(_trim_history(history))
     messages.append({"role": "user", "content": query})
     return await _call_llm_with_fallback(messages, max_tokens=1024)
 

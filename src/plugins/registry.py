@@ -9,7 +9,7 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from config import DATA_DIR, SQLITE_BUSY_TIMEOUT
+from config import DATA_DIR
 
 _DB_PATH = str(DATA_DIR / "plugins.db")
 
@@ -26,18 +26,21 @@ CREATE TABLE IF NOT EXISTS plugins (
     author TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'installed',
     manifest_json TEXT NOT NULL DEFAULT '{}',
-    installed_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
 
 def _get_conn() -> sqlite3.Connection:
+    """#3（2026-09-21）：连接创建收敛到统一工厂 make_conn（同一套 PRAGMA 口径）。
+
+    保留 thread-local 缓存（插件注册表在后台线程/子进程上下文中使用），
+    连接创建本身复用 src.storage.connection.make_conn，避免各处 PRAGMA 不一致。
+    """
     if not hasattr(_local, "conn") or _local.conn is None:
-        _local.conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _local.conn.execute("PRAGMA journal_mode=WAL")
-        _local.conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT}")
+        from src.storage.connection import make_conn
+        _local.conn = make_conn(_DB_PATH)
     return _local.conn
 
 
@@ -63,7 +66,7 @@ def register(manifest: dict) -> None:
             description=excluded.description,
             author=excluded.author,
             manifest_json=excluded.manifest_json,
-            updated_at=datetime('now','localtime')
+            updated_at=datetime('now')
         """,
         (
             manifest.get("name", ""),
@@ -106,7 +109,7 @@ def list_all() -> list[dict]:
 def set_status(name: str, status: str) -> None:
     conn = _get_conn()
     conn.execute(
-        "UPDATE plugins SET status=?, updated_at=datetime('now','localtime') WHERE name=?",
+        "UPDATE plugins SET status=?, updated_at=datetime('now') WHERE name=?",
         (status, name),
     )
     conn.commit()

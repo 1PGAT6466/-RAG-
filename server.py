@@ -66,6 +66,29 @@ async def lifespan(app: FastAPI):
             cleanup_orphans()
     except Exception as e:
         logger.warning(f"Chroma 孤儿对账失败（不影响主服务）: {e}")
+    # #9：FTS 与 chunks 主表对账（修补孤儿全文条目 / 漏索引 chunk）
+    try:
+        from src.storage.chunks import reconcile_fts
+        stats = reconcile_fts()
+        if stats.get("orphan_fts") or stats.get("missing_fts"):
+            logger.warning(f"FTS 对账结果: {stats}")
+    except Exception as e:
+        logger.warning(f"FTS 对账失败（不影响主服务）: {e}")
+    # #10：清理过期持久缓存（rerank_cache TTL + semantic_cache 上限）
+    try:
+        from src.retrieval.rerank import purge_expired_rerank_cache
+        n = purge_expired_rerank_cache()
+        if n:
+            logger.info(f"清理过期 rerank 缓存 {n} 条")
+    except Exception as e:
+        logger.warning(f"rerank 缓存清理失败（不影响主服务）: {e}")
+    try:
+        from src.chat.cache import purge_semantic_cache
+        n = purge_semantic_cache()
+        if n:
+            logger.info(f"裁剪 semantic_cache {n} 条（超上限）")
+    except Exception as e:
+        logger.warning(f"semantic_cache 清理失败（不影响主服务）: {e}")
     # 加载语义缓存
     try:
         from src.chat.cache import load_cache

@@ -59,12 +59,13 @@
     const params = new URLSearchParams(location.search);
     const fileId = cfg.fileId || params.get('file_id');
     const token = cfg.token || params.get('token');
-    if (!fileId) {
-      document.body.innerHTML = '<div style="color:#ccc;text-align:center;padding:60px">缺少 file_id</div>';
-      throw new Error('missing file_id');
-    }
     const baseUrl = cfg.baseUrl || location.origin;
-    const pdfUrl = `${baseUrl}/api/documents/${fileId}/raw?token=${encodeURIComponent(token || '')}`;
+    // 支持直接传入 pdfUrl（DMS 预览）或用 fileId 拼接（伏羲文档）
+    const pdfUrl = cfg.pdfUrl || (fileId ? `${baseUrl}/api/documents/${fileId}/raw?token=${encodeURIComponent(token || '')}` : null);
+    if (!pdfUrl) {
+      document.body.innerHTML = '<div style="color:#ccc;text-align:center;padding:60px">缺少 file_id 或 pdfUrl</div>';
+      throw new Error('missing file_id or pdfUrl');
+    }
 
     const viewer = document.getElementById('viewer');
     const btnPrev = document.getElementById('btn-prev');

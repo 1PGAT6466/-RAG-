@@ -1,4 +1,4 @@
-﻿"""
+"""
 MCP 市场元数据中文化翻译层
 ==========================
 
@@ -74,7 +74,7 @@ def _get_conn() -> sqlite3.Connection:
             "CREATE TABLE IF NOT EXISTS mcp_translations ("
             "  src TEXT PRIMARY KEY,"
             "  dst TEXT NOT NULL,"
-            "  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now'))"
             ")"
         )
         _conn_local.conn = conn

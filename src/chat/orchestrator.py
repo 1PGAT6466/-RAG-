@@ -171,10 +171,10 @@ async def handle_chat(
 
 async def _handle_meta(query: str, history: list[dict] = None) -> dict:
     """元查询模式：关于知识库本身的提问，直接查数据库而非检索。"""
-    import sqlite3
-    from config import DB_PATH
+    from src.storage.db import _get_conn
     try:
-        conn = sqlite3.connect(DB_PATH)
+        # #4（2026-09-21）：改用统一连接层，保持 WAL / busy_timeout 口径一致
+        conn = _get_conn()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM files WHERE deleted_at IS NULL")
         file_count = cur.fetchone()[0]
@@ -182,7 +182,6 @@ async def _handle_meta(query: str, history: list[dict] = None) -> dict:
         chunk_count = cur.fetchone()[0]
         cur.execute("SELECT name, category, chunk_count FROM files WHERE deleted_at IS NULL ORDER BY id")
         files = cur.fetchall()
-        conn.close()
 
         file_list = "\n".join(
             f"  - {f[0]}（{f[1] or '未分类'}，{f[2]} 个切块）" for f in files

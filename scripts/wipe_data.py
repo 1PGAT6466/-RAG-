@@ -109,4 +109,36 @@ def wipe():
 
 
 if __name__ == "__main__":
+    # #16（2026-09-21）：破坏性脚本保护——必须显式 --yes，且执行前自动备份 rag.db
+    import argparse
+    import time
+    ap = argparse.ArgumentParser(description="完整擦拭业务数据（保留 users / mcp_servers）")
+    ap.add_argument("--yes", action="store_true", help="确认执行（必填，防误操作）")
+    ap.add_argument("--no-backup", action="store_true", help="跳过自动备份（不推荐）")
+    args = ap.parse_args()
+
+    if not args.yes:
+        print("⚠️ 这是破坏性操作，将清空所有业务数据（保留用户帐号）。")
+        print("   确认无误后请加 --yes 重新执行：python scripts/wipe_data.py --yes")
+        sys.exit(2)
+
+    # 自动备份 rag.db
+    if not args.no_backup:
+        try:
+            from config import DB_PATH
+            src = Path(DB_PATH)
+            if src.exists():
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                dst = src.parent / f"rag.db.wipe_backup_{ts}"
+                import sqlite3 as _sq
+                _c = _sq.connect(str(src))
+                _c.execute(f"VACUUM INTO '{dst.as_posix()}'")
+                _c.close()
+                print(f"✅ 已自动备份: {dst}")
+            else:
+                print("⚠️ 未找到 rag.db，跳过备份")
+        except Exception as e:
+            print(f"❌ 自动备份失败，已中止（--no-backup 可强制跳过）: {e}")
+            sys.exit(3)
+
     wipe()

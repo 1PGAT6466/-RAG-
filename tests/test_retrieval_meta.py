@@ -23,7 +23,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """在全新事件循环里跑协程。
+
+    不用 `asyncio.get_event_loop()`：Python 3.11 中该 API 会在「当前线程无循环」时
+    告警/报错，且当同进程较早的 TestClient（test_e2e_*）关闭了默认循环后，
+    会抛 `RuntimeError: There is no current event loop`，导致本文件在全量跑时
+    随机失败（单独跑却通过）。新建独立循环与其它测试完全隔离。
+    """
+    return asyncio.run(coro)
 
 
 class TestMetaLayerRetrieval:

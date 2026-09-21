@@ -57,6 +57,55 @@ def get_chunks_by_file(file_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def reconcile_fts(conn=None) -> dict:
+    """#9（2026-09-21）：FTS5 与 chunks 主表对账，清理孤儿关系。
+
+    背景：chunks_fts 是虚拟表，SCHEMA 无 trigger，同步靠代码显式调用。
+    由于 FTS 需经 jieba 分词（segment_for_fts）写入，SQLite trigger 无法调 Python，
+    故采用方案 B：提供对账函数，启动/定期调用，修补两条不一致：
+      1. chunks_fts 有、chunks 主表无 → 孤儿全文条目 → 删 FTS
+      2. chunks 主表有、FTS 无 → 漏索引 chunk → 补 FTS（重新分词）
+
+    返回 {'orphan_fts': n, 'missing_fts': n}。
+    """
+    own = conn is None
+    if own:
+        conn = _get_conn()
+    from src.storage.tokenizer import segment_for_fts
+    stats = {"orphan_fts": 0, "missing_fts": 0}
+    try:
+        chunk_ids = {r[0] for r in conn.execute("SELECT id FROM chunks").fetchall()}
+        fts_ids = {r[0] for r in conn.execute("SELECT rowid FROM chunks_fts").fetchall()}
+        tri_ids = {r[0] for r in conn.execute("SELECT rowid FROM chunks_fts_tri").fetchall()}
+        # 1) 孤儿 FTS（两索引都要清）
+        orphans = (fts_ids | tri_ids) - chunk_ids
+        for oid in orphans:
+            conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (oid,))
+            conn.execute("DELETE FROM chunks_fts_tri WHERE rowid=?", (oid,))
+        stats["orphan_fts"] = len(orphans)
+        # 2) 漏索引 chunk
+        missing = chunk_ids - fts_ids
+        for mid in missing:
+            row = conn.execute("SELECT content FROM chunks WHERE id=?", (mid,)).fetchone()
+            if not row:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO chunks_fts(rowid, content) VALUES (?, ?)",
+                (mid, segment_for_fts(row[0])),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO chunks_fts_tri(rowid, content) VALUES (?, ?)",
+                (mid, _sanitize_fts_content(row[0])),
+            )
+        stats["missing_fts"] = len(missing)
+        conn.commit()
+        if orphans or missing:
+            logger.warning(f"FTS 对账：清理孤儿 {len(orphans)} 条，补建 {len(missing)} 条")
+    except Exception as e:
+        logger.error(f"FTS 对账失败: {e}")
+    return stats
+
+
 # === FTS5 全文搜索 ===
 
 def _to_fts_query(text: str) -> str:
@@ -75,7 +124,8 @@ def fts_search(query: str, limit: int = 20) -> list[dict]:
     """FTS5 BM25 全文搜索（双索引：jieba 分词 + trigram 子串），返回 chunk + 文件名"""
     conn = _get_conn()
     fts_query = _to_fts_query(query)
-    logger.warning(f"[FTS_DEBUG] query={query!r} fts_query={fts_query!r} conn={id(conn)}")
+    # 缺陷B（2026-09-21）：FTS 调试日志降为 debug，避免每次检索打 WARNING（含 query 原文）
+    logger.debug(f"[FTS_DEBUG] query={query!r} fts_query={fts_query!r} conn={id(conn)}")
 
     # 主索引：jieba 分词 + unicode61（词级匹配）
     # MATCH 用 ? 参数绑定（FTS5 官方推荐），根除 f-string 拼接的注入/语法错误面。
@@ -88,7 +138,7 @@ def fts_search(query: str, limit: int = 20) -> list[dict]:
             "WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
             (fts_query, limit)
         ).fetchall()
-        logger.warning(f"[FTS_DEBUG] main index rows={len(rows)} for query={query!r}")
+        logger.debug(f"[FTS_DEBUG] main index rows={len(rows)} for query={query!r}")
     except Exception as e:
         logger.error(f"[FTS_DEBUG] main index error: {e}")
         rows = []

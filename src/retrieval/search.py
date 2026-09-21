@@ -51,6 +51,12 @@ def _use_rerank() -> bool:
     return RAG_RERANK == "1"
 
 
+def _search_debug_enabled() -> bool:
+    """#13：检索调试日志开关（环境变量 SEARCH_DEBUG=1 时开启，默认关）。"""
+    import os
+    return os.getenv("SEARCH_DEBUG", "0") == "1"
+
+
 def _use_hyde() -> bool:
     """是否启用 HyDE 兜底（默认关闭，与 LLM 减负战略一致）"""
     from config import RAG_HYDE
@@ -149,7 +155,10 @@ async def search(query: str, top_k: int = None, with_rerank: bool = True,
     if top_k is None:
         top_k = SEARCH_TOP_K
 
-    logger.warning(f"[SEARCH_DEBUG] query={query!r} len={len(query)} top_k={top_k}")
+    # #13（2026-09-21）：检索调试日志默认降为 debug，仅在显式开启 SEARCH_DEBUG 时打。
+    # 原为 WARNING 级别，每次检索都打，会淹没真实告警。
+    if _search_debug_enabled():
+        logger.warning(f"[SEARCH_DEBUG] query={query!r} len={len(query)} top_k={top_k}")
 
     # 阶段级耗时打点（可观测性地基，零副作用）
     _t0 = time.perf_counter()

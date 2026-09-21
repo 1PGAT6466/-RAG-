@@ -42,56 +42,79 @@ async def api_upload(
     from pathlib import Path as _Path
     import hashlib
     safe_name = _Path(file.filename or "").name or "upload"
+    # #21（2026-09-21）：扩展名白名单校验（拒绝未知类型，降低任意文件分发/垃圾堆积风险）
+    from config import UPLOAD_ALLOWED_EXT
+    _ext = _Path(safe_name).suffix.lower()
+    if UPLOAD_ALLOWED_EXT and _ext not in UPLOAD_ALLOWED_EXT:
+        raise BizError(
+            ErrorCode.UNSUPPORTED_FORMAT,
+            f"不支持的文件类型：{_ext or '（无扩展名）'}，允许：{', '.join(UPLOAD_ALLOWED_EXT)}",
+        )
     from config import MAX_UPLOAD_SIZE_MB
     limit_bytes = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
-    # 读取上传字节流（限制大小）
-    content = bytearray()
-    while chunk := await file.read(8 * 1024 * 1024):
-        content.extend(chunk)
-        if len(content) > limit_bytes:
-            raise BizError(ErrorCode.UPLOAD_TOO_LARGE, f"文件过大，上限 {MAX_UPLOAD_SIZE_MB}MB")
-    if len(content) == 0:
-        raise BizError(ErrorCode.EMPTY_FILE)
-    content_bytes = bytes(content)
-
-    # P22: 计算 sha256 并检查去重
-    content_hash = hashlib.sha256(content_bytes).hexdigest()
-    from src.storage.files import get_file_by_hash
-    existing = get_file_by_hash(content_hash)
-    if existing:
-        logger.info(f"P22 去重: 文件 '{safe_name}' 与已有文件 id={existing['id']} '{existing['name']}' 内容相同，跳过")
-        from src.storage.audit import log_action
-        log_action(user_id=user.get("id"), username=user.get("username"),
-                   action="upload_dedup", target_type="file", target_id=existing["id"],
-                   detail=f"filename={safe_name}, existing={existing['name']}")
-        return {
-            "status": "ok",
-            "data": {
-                "dms_doc_id": None,
-                "task_id": None,
-                "filename": safe_name,
-                "existing_file_id": existing['id'],
-                "existing_file_name": existing['name'],
-                "message": f"内容与已有文件 '{existing['name']}'(id={existing['id']}) 完全相同，跳过重复入库",
-                "dedup": True,
-            },
-        }
-
-    # 1) 写入 SeedDMS（原件唯一存储）——这一步同步完成，快速返回
-    from src.dms.writer import upload_document, SeedDMSWriteError
-    target_folder = folder_id or 1  # 默认根文件夹
+    # #23（2026-09-21）：流式写入临时文件 + 增量 sha256，避免整文件驻留内存。
+    # 同时#缺陷C：边读边写、边累加尺寸，超限立即中断并删临时文件（不先吞满内存）。
+    import tempfile
+    import os as _os
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="fuxi_upload_", suffix=_ext)
+    sha = hashlib.sha256()
+    total = 0
     try:
-        dms_doc_id = upload_document(
-            folder_id=target_folder,
-            filename=safe_name,
-            content=content_bytes,
-        )
-    except SeedDMSWriteError as e:
-        raise BizError(ErrorCode.DMS_WRITE_FAILED, str(e))
-    except Exception as e:
-        logger.error(f"写入 SeedDMS 失败: {e}")
-        raise BizError(ErrorCode.DMS_WRITE_FAILED, f"写入 SeedDMS 失败: {e}")
+        with _os.fdopen(tmp_fd, "wb") as tf:
+            while chunk := await file.read(8 * 1024 * 1024):
+                total += len(chunk)
+                if total > limit_bytes:
+                    raise BizError(ErrorCode.UPLOAD_TOO_LARGE, f"文件过大，上限 {MAX_UPLOAD_SIZE_MB}MB")
+                tf.write(chunk)
+                sha.update(chunk)
+        if total == 0:
+            raise BizError(ErrorCode.EMPTY_FILE)
+        content_hash = sha.hexdigest()
+
+        # P22: 内容去重（sha256）
+        from src.storage.files import get_file_by_hash
+        existing = get_file_by_hash(content_hash)
+        if existing:
+            logger.info(f"P22 去重: 文件 '{safe_name}' 与已有文件 id={existing['id']} '{existing['name']}' 内容相同，跳过")
+            from src.storage.audit import log_action
+            log_action(user_id=user.get("id"), username=user.get("username"),
+                       action="upload_dedup", target_type="file", target_id=existing["id"],
+                       detail=f"filename={safe_name}, existing={existing['name']}")
+            return {
+                "status": "ok",
+                "data": {
+                    "dms_doc_id": None,
+                    "task_id": None,
+                    "filename": safe_name,
+                    "existing_file_id": existing['id'],
+                    "existing_file_name": existing['name'],
+                    "message": f"内容与已有文件 '{existing['name']}'(id={existing['id']}) 完全相同，跳过重复入库",
+                    "dedup": True,
+                },
+            }
+
+        # 1) 写入 SeedDMS（原件唯一存储）——流式落盘，不阻塞上传后向量化
+        from src.dms.writer import upload_document, SeedDMSWriteError
+        target_folder = folder_id or 1  # 默认根文件夹
+        try:
+            dms_doc_id = upload_document(
+                folder_id=target_folder,
+                filename=safe_name,
+                content_path=tmp_path,
+            )
+        except SeedDMSWriteError as e:
+            raise BizError(ErrorCode.DMS_WRITE_FAILED, str(e))
+        except Exception as e:
+            logger.error(f"写入 SeedDMS 失败: {e}")
+            raise BizError(ErrorCode.DMS_WRITE_FAILED, f"写入 SeedDMS 失败: {e}")
+    finally:
+        # 清理临时文件
+        try:
+            if _os.path.exists(tmp_path):
+                _os.remove(tmp_path)
+        except Exception:
+            pass
 
     # 2) 向量化丢后台异步执行（不阻塞上传）
     task_id = _spawn_vectorize(dms_doc_id, safe_name, content_hash=content_hash)
@@ -116,8 +139,12 @@ _vectorize_jobs: dict[int, dict] = {}
 def _spawn_vectorize(dms_doc_id: int, filename: str, content_hash: str = None) -> str | None:
     """后台线程：从 SeedDMS 拉取文档并向量化入库（复用 import_service 闭环）。
 
-    返回 task_id（入库引擎 task_id，用于轮询实时进度），但 task_id 是在 enqueue
-    时才生成的，故这里先登记占位，真正 task_id 由 on_task 回调回填。
+    #24（2026-09-21）：task_id 契约明确化——本函数返回值恒为 None。
+
+    原因：真实 task_id 由入库引擎在 enqueue 时才生成（内存 _tasks 的 key，重启即丢），
+    无法在登记时预先给出一个能对齐的真实 ID（造假 ID 会误导前端轮询）。
+    因此约定：**上传响应中 task_id 恒为 null；进度一律走 `GET /api/documents/upload/{task_id}/progress`
+    或按 dms_doc_id 反查 vectorize-status**。占位记录仅用于前端按 dms_doc_id 反查。
     """
     import threading
     import time
@@ -176,6 +203,13 @@ def _spawn_vectorize(dms_doc_id: int, filename: str, content_hash: str = None) -
             if job:
                 job["status"] = "failed"
                 job["error"] = str(e)
+        finally:
+            # #7（2026-09-21）：线程结束释放 thread-local SQLite 连接
+            try:
+                from src.storage.db import close_thread_conn
+                close_thread_conn()
+            except Exception:
+                pass
 
     t = threading.Thread(target=_work, name=f"dms-vectorize-{dms_doc_id}", daemon=True)
     t.start()
@@ -498,10 +532,13 @@ def api_health():
 
     # 1. SQLite 可达
     try:
-        import sqlite3
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("SELECT 1").fetchone()
-        conn.close()
+        # #4（2026-09-21）：health 检查改用统一连接层（带 WAL/busy_timeout），用完即关
+        from src.storage.db import _new_conn
+        conn = _new_conn()
+        try:
+            conn.execute("SELECT 1").fetchone()
+        finally:
+            conn.close()
         checks["db"] = "ok"
     except Exception as e:
         checks["db"] = f"error: {e}"

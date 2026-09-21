@@ -124,7 +124,7 @@ def update_page(page_id: int, title: str = None, content_md: str = None,
     if not updates:
         return False
 
-    updates.append("updated_at=datetime('now','localtime')")
+    updates.append("updated_at=datetime('now')")
     updates.append("version=version+1")
     params.append(page_id)
     conn.execute(f"UPDATE wiki_pages SET {', '.join(updates)} WHERE id=?", params)

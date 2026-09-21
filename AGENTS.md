@@ -1,4 +1,7 @@
-# AGENTS.md — 更新RAG框架
+# AGENTS.md — 更新RAG框架（伏羲 RAG）
+
+> 别名说明：项目对外名称「伏羲 RAG」（见 README），内部目录/仓库名「更新RAG框架」。
+> 两者指同一系统，检索/沟通时请勿混淆。
 
 ## Quick start
 
@@ -12,31 +15,48 @@ cd frontend && npm run dev             # starts on http://localhost:3000, proxie
 # Frontend production build (served by backend as SPA)
 cd frontend && npm run build           # output → frontend/dist/, server.py mounts it
 
+# Tests (pytest — tests/ 下有 18+ 用例文件)
+python -m pytest                       # 全量单元/集成测试
+python -m pytest tests/test_storage.py -q
+
 # Smoke test (requires running server + data/rag.db with documents)
 python scripts/smoke_test.py           # full chain: auth → search → chat → graph → plugins → RBAC
 python scripts/smoke_test.py --base http://192.168.x.x:8099
+
+# DB schema migration (versioned, schema_version table)
+python scripts/migrate.py status       # 当前版本 + 待执行迁移
+python scripts/migrate.py upgrade      # 应用 pending 迁移
 ```
 
-No test framework (pytest/unittest) exists. `scripts/smoke_test.py` is the only automated verification.
+**双轨验证**：`pytest`（组件级回归）+ `scripts/smoke_test.py`（端到端全链路）。
+注意：`init_db()` 启动时会自动应用 `migrations/` 下的 pending 迁移（见 Gotchas 11）。
 
 ## Architecture
 
 ```
 server.py          → FastAPI app, lifespan init, SPA fallback
 config.py          → all config from .env, single source of truth for flags
-src/api.py         → all HTTP routes (/api/*), thin controller layer
-src/auth/          → JWT auth (login/register) + RBAC (get_current_user / require_admin)
-src/pipeline/      → document ingest engine (Stage-based, sync+async)
+src/api/           → HTTP routes split by domain, thin controller layer:
+                     auth / chat / conversations / documents / search / graph /
+                     config / dms / feedback / wiki / errors
+src/auth/          → JWT auth (login/register) + RBAC (get_current_user / require_admin) + rate_limit
+src/pipeline/      → document ingest engine (Stage-based, sync+async) + parser/chunker/backends/quality
 src/retrieval/     → hybrid search: BM25 + vector + graph recall → RRF fusion → rerank
-src/chat/          → LLM generation with citation markup [1][2]
+src/chat/          → LLM generation with citation markup [1][2] + semantic cache
 src/storage/       → SQLite (WAL mode) + ChromaDB vectors + FTS5 full-text
+                     connection.py (统一连接层) / files.py / chunks.py / entities.py /
+                     conversations.py / feedback.py / wiki.py / tasks.py / db.py (re-export)
 src/extraction/    → entity extraction (rule-based + optional LLM)
-src/plugins/       → plugin system (manifest.json + subprocess host + hooks)
+src/plugins/       → plugin system (manifest.json + subprocess host + hooks + registry)
 src/mcp/           → Smithery MCP marketplace integration
+src/dms/           → SeedDMS writer/import/sync (原件唯一存储)
+src/llm/ + src/llm_client.py → LLM calls (httpx) + fallback chain
 src/classification.py → single authoritative category dictionary (shared by classify + ranking)
+migrations/        → versioned schema migrations (001-005) + scripts/migrate.py
 frontend/          → Vue 3 SPA (Element Plus, D3 graph, Pinia stores)
 plugins/           → plugin directories (each has manifest.json + entry .py)
 scripts/           → operational scripts (start/stop, smoke test, data migration, watcher)
+tests/             → pytest suites (18 files)
 data/              → runtime data (rag.db, uploads, images, ChromaDB) — gitignored
 ```
 
@@ -157,7 +177,17 @@ Categories: 外购件选型, 连接器, 材料选型, 工艺规程, 机械设计
 
 9. **MCP SDK dependency conflict**: `pip install mcp` (v2.0+) installs `httpx2` which **replaces** `httpx`, breaking all `import httpx` across the project. Always use `mcp>=1.0.0,<2.0.0` (pinned in `requirements.txt`). mcp 1.x uses native httpx, no conflict.
 
-10. **No requirements.txt until now**: The project had no dependency manifest. Use `pip install -r requirements.txt` for a clean setup. The MCP client (`src/mcp/client.py`) requires the `mcp` package which is optional — MCP features degrade gracefully if not installed.
+10. **Dependencies are range-pinned**: `requirements.txt` uses `>=` with upper bounds only where risk is high (mcp, chromadb, PyMuPDF, pydantic). Adding new deps: always consider an upper bound for libs known to break APIs across majors.
+
+11. **Startup auto-migrates**: `init_db()` runs `migrations/` pending migrations and maintains `schema_version`. Do NOT add schema changes inline in `init_db()` — put them in a numbered migration file (`migrations/00N_*.py` with `up(conn)` / `UP_SQL`).
+
+12. **Timestamps are UTC**: All `created_at`/`updated_at`/`imported_at` columns default to UTC (`datetime('now')`) since migration 005. Do not use `datetime('now','localtime')` in new SQL. API/frontend handles local display; `feedback.py`/`rerank.py` TTL parsers assume UTC.
+
+13. **rerank_cache schema is fixed**: columns are `(q, top_k, fp, results_json, created_at)` with composite PK. It previously conflicted with a duplicate definition in `rerank.py` causing silent cache failure. Keep `connection.py` SCHEMA as the single source; `rerank.py` must not redefine it.
+
+14. **FTS sync is manual + reconciled**: `chunks_fts`/`chunks_fts_tri` have no triggers (inserts go through `segment_for_fts` jieba). On delete, `permanent_delete_file` must delete both FTS rows AND the `chunks` rows. Startup calls `reconcile_fts()` to repair orphans.
+
+15. **All rerank paths emit 0-1 scores**: SiliconFlow (native 0-1), DeepSeek (normalized 0-10 → 0-1), local TF-IDF (min-max blended with RRF). Keep any new scorer on the same 0-1 scale or downstream ordering will jump between providers.
 
 ## .env essentials
 

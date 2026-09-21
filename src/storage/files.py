@@ -132,7 +132,7 @@ def list_files_with_entities(category: str = None, model: str = None, material: 
 def update_file_category(file_id: int, category: str):
     conn = _get_conn()
     conn.execute(
-        "UPDATE files SET category=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE files SET category=?, updated_at=datetime('now') WHERE id=?",
         (category, file_id)
     )
     conn.commit()
@@ -141,7 +141,7 @@ def update_file_category(file_id: int, category: str):
 def update_file_tags(file_id: int, tags: list[str]):
     conn = _get_conn()
     conn.execute(
-        "UPDATE files SET tags=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE files SET tags=?, updated_at=datetime('now') WHERE id=?",
         (_dumps(tags), file_id)
     )
     conn.commit()
@@ -150,7 +150,7 @@ def update_file_tags(file_id: int, tags: list[str]):
 def update_file_summary(file_id: int, summary: str):
     conn = _get_conn()
     conn.execute(
-        "UPDATE files SET summary=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE files SET summary=?, updated_at=datetime('now') WHERE id=?",
         (summary or "", file_id)
     )
     conn.commit()
@@ -161,7 +161,7 @@ def update_file_folder(file_id: int, folder: str):
     conn = _get_conn()
     folder = normalize_folder(folder)
     conn.execute(
-        "UPDATE files SET folder=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE files SET folder=?, updated_at=datetime('now') WHERE id=?",
         (folder, file_id)
     )
     conn.commit()
@@ -218,7 +218,7 @@ def delete_file(file_id: int):
     """软删除：设置 deleted_at，数据保留可恢复（P23）"""
     conn = _get_conn()
     conn.execute(
-        "UPDATE files SET deleted_at = datetime('now','localtime') WHERE id = ?",
+        "UPDATE files SET deleted_at = datetime('now') WHERE id = ?",
         (file_id,)
     )
     conn.commit()
@@ -259,10 +259,11 @@ def permanent_delete_file(file_id: int):
         conn.execute("DELETE FROM entity_files WHERE file_id=?", (file_id,))
         # 清理 links
         conn.execute("DELETE FROM links WHERE source_id=? OR target_id=?", (file_id, file_id))
-        # 清理 chunks + FTS
+        # 清理 FTS + chunks（#9/缺陷F：原先只删 FTS、漏删 chunks 本体 → 孤儿 chunk）
         for cid in cid_list:
             conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (cid,))
             conn.execute("DELETE FROM chunks_fts_tri WHERE rowid=?", (cid,))
+        conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
         conn.execute("DELETE FROM files WHERE id=?", (file_id,))
 
     # 3) 删磁盘图片
@@ -311,7 +312,7 @@ def update_file_doc_meta(file_id: int, doc_kind: str, authority: int):
     """写入文档类型 + 权威等级（元数据层，检索精准度消费）"""
     conn = _get_conn()
     conn.execute(
-        "UPDATE files SET doc_kind=?, authority=?, updated_at=datetime('now','localtime') WHERE id=?",
+        "UPDATE files SET doc_kind=?, authority=?, updated_at=datetime('now') WHERE id=?",
         (doc_kind or "未分类", int(authority or 0), file_id)
     )
     conn.commit()

@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.storage.db import _get_conn, init_db, DB_PATH
-from config import UPLOAD_DIR, DATA_DIR
+from src.storage.db import _get_conn, init_db
+from config import UPLOAD_DIR, DATA_DIR, DB_PATH
 
 
 def reset():
@@ -68,4 +68,32 @@ def reset():
 
 
 if __name__ == "__main__":
+    # #16（2026-09-21）：破坏性脚本保护——必须显式 --yes，且执行前自动备份 rag.db
+    import argparse
+    import time
+    ap = argparse.ArgumentParser(description="重置数据（清空业务表 + Chroma + uploads）")
+    ap.add_argument("--yes", action="store_true", help="确认执行（必填，防误操作）")
+    ap.add_argument("--no-backup", action="store_true", help="跳过自动备份（不推荐）")
+    args = ap.parse_args()
+
+    if not args.yes:
+        print("⚠️ 这是破坏性操作，将清空业务数据。确认请输入：python scripts/reset_data.py --yes")
+        sys.exit(2)
+
+    if not args.no_backup:
+        try:
+            from config import DB_PATH
+            src = Path(DB_PATH)
+            if src.exists():
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                dst = src.parent / f"rag.db.reset_backup_{ts}"
+                import sqlite3 as _sq
+                _c = _sq.connect(str(src))
+                _c.execute(f"VACUUM INTO '{dst.as_posix()}'")
+                _c.close()
+                print(f"✅ 已自动备份: {dst}")
+        except Exception as e:
+            print(f"❌ 自动备份失败，已中止（--no-backup 可跳过）: {e}")
+            sys.exit(3)
+
     reset()

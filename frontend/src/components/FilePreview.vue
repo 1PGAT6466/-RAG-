@@ -1,7 +1,7 @@
-<template>
+﻿<template>
   <el-dialog
     v-model="visible"
-    :title="'预览：' + (fileName || '')"
+    :title="(isDmsMode ? 'DMS 预览：' : '预览：') + (effectiveName || '')"
     width="85%"
     top="3vh"
     append-to-body
@@ -65,6 +65,9 @@ const props = defineProps({
   fileId: Number,
   fileName: String,
   ext: String,
+  dmsDocId: Number,       // SeedDMS 文档 ID（未导入伏羲的 DMS 文档）
+  dmsFileName: String,    // SeedDMS 文件名
+  dmsExt: String,         // SeedDMS 文件扩展名
 })
 const emit = defineEmits(['update:modelValue'])
 
@@ -81,10 +84,15 @@ const activeSheet = ref('')
 const sheetsData = ref({})
 const pdfUrl = ref('')
 
-const extLower = computed(() => (props.ext || '').toLowerCase().replace('.', ''))
+const extLower = computed(() => {
+  const ext = props.dmsExt || props.ext || ''
+  return ext.toLowerCase().replace('.', '')
+})
+const effectiveName = computed(() => props.dmsFileName || props.fileName || '')
 const isWord = computed(() => ['docx'].includes(extLower.value))
 const isExcel = computed(() => ['xlsx', 'xls'].includes(extLower.value))
 const isPdf = computed(() => extLower.value === 'pdf')
+const isDmsMode = computed(() => !!props.dmsDocId)
 
 const currentSheetData = computed(() => sheetsData.value[activeSheet.value] || [])
 const maxCols = computed(() => {
@@ -126,22 +134,37 @@ async function loadPreview() {
     try {
       const resp = await fetch('/pdf-viewer.html?v=2')
       let html = await resp.text()
-      // 注入实际的 file_id 和 token
-      // 在 </head> 前注入配置，pdf-viewer 会从 window.__PDF_CONFIG 读取
-      const configScript = `<script>window.__PDF_CONFIG={fileId:${props.fileId},token:"${token}",baseUrl:"${window.location.origin}"}<\/script>`
+      // DMS 模式：用 DMS 下载端点；伏羲模式：用 documents/raw 端点
+      const pdfEndpoint = isDmsMode.value
+        ? `${window.location.origin}/api/dms/download/${props.dmsDocId}?token=${encodeURIComponent(token)}`
+        : `${window.location.origin}/api/documents/${props.fileId}/raw?token=${encodeURIComponent(token)}`
+      // 注入配置：pdf-viewer 从 window.__PDF_CONFIG 读取
+      // 使用 pdfUrl 字段直接指定完整 URL（绕过 fileId 逻辑）
+      const configScript = `<script>window.__PDF_CONFIG={pdfUrl:"${pdfEndpoint}",token:"${token}",baseUrl:"${window.location.origin}"}<\/script>`
       html = html.replace('</head>', configScript + '</head>')
       const blob = new Blob([html], { type: 'text/html' })
       pdfUrl.value = URL.createObjectURL(blob)
     } catch (e) {
       // 降级：直接用后端 URL
-      pdfUrl.value = `/api/documents/${props.fileId}/raw?token=${encodeURIComponent(token)}`
+      if (isDmsMode.value) {
+        pdfUrl.value = `/api/dms/download/${props.dmsDocId}?token=${encodeURIComponent(token)}`
+      } else {
+        pdfUrl.value = `/api/documents/${props.fileId}/raw?token=${encodeURIComponent(token)}`
+      }
     }
     loading.value = false
     return
   }
   try {
-    const resp = await api.get(`/documents/${props.fileId}/raw`, { responseType: 'blob' })
-    const blob = resp.data
+    // DMS 模式：从 SeedDMS 下载；伏羲模式：从伏羲下载
+    let blob
+    if (isDmsMode.value) {
+      const resp = await api.get(`/dms/download/${props.dmsDocId}`, { responseType: 'blob' })
+      blob = resp.data
+    } else {
+      const resp = await api.get(`/documents/${props.fileId}/raw`, { responseType: 'blob' })
+      blob = resp.data
+    }
     if (isWord.value) {
       await renderWord(blob)
     } else if (isExcel.value) {

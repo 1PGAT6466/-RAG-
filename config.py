@@ -57,7 +57,7 @@ JWT_SECRET = _resolve_jwt_secret()
 JWT_EXPIRY_HOURS = int(_env("JWT_EXPIRY_HOURS", "24"))
 
 # CORS：逗号分隔的允许来源；默认仅 localhost（内网 IP 请在 .env 用 CORS_ORIGINS 配置）
-_DEFAULT_CORS = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8099,http://127.0.0.1:8099"
+_DEFAULT_CORS = "http://localhost:4999,http://127.0.0.1:4999,http://localhost:8099,http://127.0.0.1:8099"
 CORS_ORIGINS = [o.strip() for o in _env("CORS_ORIGINS", _DEFAULT_CORS).split(",") if o.strip()]
 
 # 路径
@@ -115,6 +115,13 @@ RAG_ADAPTIVE = _env("RAG_ADAPTIVE", "1")  # 开关
 # 上传
 MAX_UPLOAD_SIZE_MB = int(_env("MAX_UPLOAD_SIZE_MB", "200"))
 UPLOAD_TIMEOUT = int(_env("UPLOAD_TIMEOUT", "600"))
+# #21（2026-09-21）：上传扩展名白名单（逗号分隔，小写含点）。空串表示不限制（回退旧行为）。
+UPLOAD_ALLOWED_EXT = [
+    e.strip().lower() for e in _env(
+        "UPLOAD_ALLOWED_EXT",
+        ".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.md,.log,.json,.xml",
+    ).split(",") if e.strip()
+]
 
 # 检索
 SEARCH_TOP_K = int(_env("SEARCH_TOP_K", "10"))

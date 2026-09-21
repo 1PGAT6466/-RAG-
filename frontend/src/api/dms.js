@@ -47,5 +47,13 @@ export default {
   // 按 file_id 反查来源
   recordByFile(fileId) {
     return api.get('/dms/record', { params: { file_id: fileId } })
+  },
+  // 从 SeedDMS 下载文档内容
+  downloadUrl(docId) {
+    const token = sessionStorage.getItem('token') || ''
+    return `/api/dms/download/${docId}?token=${encodeURIComponent(token)}`
+  },
+  download(docId) {
+    return api.get(`/dms/download/${docId}`, { responseType: 'blob' })
   }
 }

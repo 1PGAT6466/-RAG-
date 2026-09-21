@@ -269,6 +269,32 @@ def api_dms_replace_all(user=Depends(require_admin)):
 
 # === 反查：已知 file_id 查 SeedDMS 来源 ===
 
+# === 下载：从 SeedDMS 获取文档内容 ===
+
+@router.get("/api/dms/download/{doc_id}")
+def api_dms_download(doc_id: int, user=Depends(get_current_user)):
+    """从 SeedDMS 下载文档内容（二进制流）"""
+    from fastapi.responses import Response
+    client = get_client()
+    try:
+        if not client.login():
+            raise HTTPException(502, "SeedDMS 登录失败")
+        content, filename, mime = client.download_document(doc_id)
+        return Response(
+            content=content,
+            media_type=mime or "application/octet-stream",
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Content-Length": str(len(content)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"DMS 文档下载失败 doc_id={doc_id}: {e}")
+        raise HTTPException(502, f"下载失败: {e}")
+
+
 @router.get("/api/dms/record")
 def api_dms_record_by_file(file_id: int, user=Depends(get_current_user)):
     """按伏羲 file_id 反查 SeedDMS 来源记录（供文档详情页展示）"""
