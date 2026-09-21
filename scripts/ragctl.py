@@ -57,6 +57,44 @@ def _log(msg: str = ""):
     print(f"{_TAG} {msg}" if msg else "")
 
 
+# --- 体检/状态历史落盘（便于回溯“什么时候开始不对的”）---
+DOCTOR_HISTORY = LOG_DIR / "doctor_history.log"
+_HISTORY_MAX_LINES = 8000
+
+
+def _record_history(kind: str, text: str):
+    """把一次命令的完整输出追加到历史日志（带时间戳），并限长防涨。
+
+    首次创建时写 UTF-8 BOM，保证 Windows 记事本/PowerShell 也能正确显示中文。
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_new = not DOCTOR_HISTORY.exists() or DOCTOR_HISTORY.stat().st_size == 0
+        with open(DOCTOR_HISTORY, "a", encoding="utf-8-sig" if is_new else "utf-8") as f:
+            f.write(f"\n{'=' * 60}\n[{ts}] {kind}\n{'=' * 60}\n{text.strip()}\n")
+        # 控制文件大小：超过上限则保留最后 N 行
+        lines = DOCTOR_HISTORY.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        if len(lines) > _HISTORY_MAX_LINES:
+            DOCTOR_HISTORY.write_text("\n".join(lines[-_HISTORY_MAX_LINES:]) + "\n",
+                                      encoding="utf-8-sig")
+    except Exception:
+        pass  # 历史记录失败绝不影响主命令
+
+
+def _capture(fn, *args, **kwargs):
+    """捕获函数的标准输出，返回 (返回码, 文本)。"""
+    import io
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        code = fn(*args, **kwargs)
+    finally:
+        sys.stdout = old
+    return code, buf.getvalue()
+
+
 def _ok(msg: str):
     print(f"  [OK]   {msg}")
 
@@ -241,6 +279,13 @@ def cmd_restart(args) -> int:
 # ======================================================================
 
 def cmd_status(_args) -> int:
+    code, text = _capture(_status_impl, _args)
+    sys.stdout.write(text)
+    _record_history("status", text)
+    return code
+
+
+def _status_impl(_args) -> int:
     running, pid = _is_running()
     _log("=" * 46)
     _log("伏羲 RAG 状态")
@@ -323,6 +368,13 @@ def cmd_status(_args) -> int:
 # ======================================================================
 
 def cmd_doctor(_args) -> int:
+    code, text = _capture(_doctor_impl)
+    sys.stdout.write(text)
+    _record_history("doctor", text)
+    return code
+
+
+def _doctor_impl() -> int:
     _log("=" * 52)
     _log("伏羲 RAG 全链路体检")
     _log("=" * 52)
@@ -373,13 +425,16 @@ def cmd_doctor(_args) -> int:
     try:
         r = subprocess.run([sys.executable, str(ROOT / "scripts" / "health_check.py"),
                             "--db", str(DB_PATH)],
-                           capture_output=True, text=True, timeout=120, cwd=str(ROOT))
+                           capture_output=True, text=True, timeout=120, cwd=str(ROOT),
+                           encoding="utf-8", errors="replace")
         if r.returncode == 0:
             _ok("数据一致性巡检通过（无孤儿 chunk / 计数一致 / FTS 行数一致）")
         else:
-            _err("数据一致性巡检发现问题：")
-            for line in (r.stdout or "").strip().splitlines()[-12:]:
-                print(f"         {line}")
+            _err("数据一致性巡检发现问题（完整输出见下）：")
+            # 完整输出（不再截断），便于定位到具体是哪个表/文件漂移
+            full = (r.stdout or "").strip()
+            for line in full.splitlines():
+                print(f"           {line}")
             problems.append("data_inconsistency")
     except Exception as e:
         _warn(f"一致性巡检无法执行: {e}")
@@ -488,17 +543,10 @@ def cmd_diag(_args) -> int:
 
     _log(f"正在打包诊断信息 → {zip_path.name}")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # 1. 状态快照
-        import io
-        buf = io.StringIO()
-        old = sys.stdout
-        sys.stdout = buf
-        try:
-            cmd_status(None)
-            cmd_doctor(None)
-        finally:
-            sys.stdout = old
-        zf.writestr("status.txt", buf.getvalue())
+        # 1. 状态快照（用 _capture 避免重复实现；直接调 *Impl 避免写冗余历史）
+        _c1, status_txt = _capture(_status_impl, None)
+        _c2, doctor_txt = _capture(_doctor_impl)
+        zf.writestr("status.txt", status_txt + "\n" + doctor_txt)
 
         # 2. 健康 & 指标（脱敏后）
         h = _check_health(timeout=5)
@@ -712,6 +760,28 @@ def cmd_fts_reconcile(_args) -> int:
         return 1
 
 
+def cmd_history(args) -> int:
+    """查看体检/状态历史（doctor 与 status 的历次输出）。"""
+    n = getattr(args, "n", 2)
+    if not DOCTOR_HISTORY.exists():
+        _warn("暂无历史记录（跑一次 ragctl doctor / status 后自动生成）")
+        return 1
+    try:
+        text = DOCTOR_HISTORY.read_text(encoding="utf-8-sig", errors="replace")
+        blocks = text.split("=" * 60)
+        # 每段由分隔线分隔，取末尾 n 段有意义内容
+        sections = [b.strip() for b in text.split("\n" + "=" * 60 + "\n") if b.strip()]
+        for sec in sections[-n:]:
+            print(sec)
+            print()
+        _log(f"共 {len(sections)} 条记录，本次显示最后 {min(n, len(sections))} 条")
+        _log(f"完整历史文件: {DOCTOR_HISTORY}")
+    except Exception as e:
+        _err(f"读取历史失败: {e}")
+        return 1
+    return 0
+
+
 def cmd_logs(args) -> int:
     n = getattr(args, "n", 50)
     log_file = LOG_DIR / "server.log"
@@ -769,6 +839,9 @@ def _build_parser() -> argparse.ArgumentParser:
     lg = sub.add_parser("logs", help="查看日志尾")
     lg.add_argument("n", nargs="?", type=int, default=50, help="行数，默认 50")
 
+    hs = sub.add_parser("history", help="查看 doctor/status 历史记录")
+    hs.add_argument("n", nargs="?", type=int, default=2, help="显示最近 N 条，默认 2")
+
     mt = sub.add_parser("metrics", help="拉取 /api/metrics（需 token）")
     mt.add_argument("--token", type=str, default=None, help="管理员 JWT")
 
@@ -787,7 +860,7 @@ def main() -> int:
         "status": cmd_status, "doctor": cmd_doctor, "diag": cmd_diag,
         "health": cmd_health, "tasks": cmd_tasks, "backup": cmd_backup,
         "logs": cmd_logs, "metrics": cmd_metrics, "reset-vector": cmd_reset_vector,
-        "fts-reconcile": cmd_fts_reconcile,
+        "fts-reconcile": cmd_fts_reconcile, "history": cmd_history,
     }
     try:
         return handlers[args.cmd](args)
