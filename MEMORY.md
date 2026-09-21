@@ -48,6 +48,8 @@
 - **启动自愈**：`reconcile_chunk_counts()` —— 流式入库中断（服务重启）会遗留 `files.chunk_count` 漂移，lifespan 启动时自动对账修正。
 - **每日巡检**：`scripts/ops_daily.py`（备份+体检，有问题非零退出）。已挂 cron：每天 08:30 Asia/Shanghai。
 - **运维归档（当天覆盖，Markdown）**：所有运维日志/报告统一到 `E:\测试项目\自建知识库\伏羲运维手册\日志\<YYYYMD>\`（如 `2026921`，月/日不补零），**全部 .md 格式**：`combined_report.md`（合并）/`status_report.md`/`doctor_report.md`/`ops_daily.md`/`diag_report.zip`。**每天一文件夹，当天多次运行覆盖旧文件**；旧格式 .txt/.log 会被自动清理。可用 `RAG_OPS_ARCHIVE` 环境变量覆盖；归档盘不可用时回退 `data/ops_archive/`。查看：`ragctl history`。
+- **⚠️ 脚本编码铁律（必遵三人则，否则中文乱码）**：①`ragctl.py`/`health_check.py`/`ops_daily.py` 启动时 `sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")`；②所有 `subprocess.run` 用 `stdout=subprocess.PIPE, stderr=subprocess.STDOUT`（**不可用 capture_output=True + stderr= 组合，会报 ValueError**）+ `encoding="utf-8"`；③所有写盘用 `encoding="utf-8-sig"`。
+  - `health_check.py` 的**汇总行走 stderr**（历史行为），调用方必须合并 stderr 否则丢关键信息（曾导致「报错但看不到具体哪项漂移」）。
 
 ## 🔴 SeedDMS（原件唯一存储）
 
