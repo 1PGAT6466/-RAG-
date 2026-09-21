@@ -1,7 +1,12 @@
 """伏羲 RAG 每日巡检（定时任务用）
 
 用途：被 cron / 计划任务调用，执行 backup + doctor，把结果写入
-      data/logs/ops_daily.log，并在发现问题时以非零退出码结束（供告警链路消费）。
+      <归档目录>/<YYYYMD>/ops_daily.log（按天建文件夹，当天覆盖）。
+      发现问题时以非零退出码结束（供告警链路消费）。
+
+归档目录（可用环境变量 RAG_OPS_ARCHIVE 覆盖）：
+    E:\测试项目\自建知识库\伏羲运维手册\日志\<YYYYMD>\
+        例：2026-09-21 → 2026921
 
 用法：
     python scripts/ops_daily.py            # 备份 + 体检
@@ -10,16 +15,33 @@
 设计原则：
     - 零外部依赖，纯 stdlib + 调用 ragctl / backup.py
     - 不修改任何业务数据（体检只读；备份是独立快照）
-    - 幂等：可重复执行
+    - 幂等：可重复执行，当天多次运行覆盖旧报告
 """
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-LOG_FILE = ROOT / "data" / "logs" / "ops_daily.log"
+
+# 归档目录：与 ragctl 保持一致（按天建文件夹，当天覆盖）
+# \u53ef\u7528\u73af\u5883\u53d8\u91cf RAG_OPS_ARCHIVE \u8986\u76d6
+ARCHIVE_ROOT = Path(os.getenv("RAG_OPS_ARCHIVE", r"E:\测试项目\自建知识库\伏羲运维手册\日志"))
+
+
+def _today_dir() -> Path:
+    """当天归档目录：<ARCHIVE_ROOT>/<YYYYMD>（如 2026921）。归档盘不可用时回退本地。"""
+    now = datetime.now()
+    name = f"{now.year}{now.month}{now.day}"
+    d = ARCHIVE_ROOT / name
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        d = ROOT / "data" / "ops_archive" / name
+        d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _run(args: list) -> tuple[int, str]:
@@ -40,7 +62,7 @@ def main() -> int:
     parser.add_argument("--keep", type=int, default=7, help="备份保留份数")
     args = parser.parse_args()
 
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOG_FILE = _today_dir() / "ops_daily.log"
     py = sys.executable
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"\n{'=' * 60}", f"[{ts}] 伏羲每日巡检开始", f"{'=' * 60}"]
@@ -70,19 +92,12 @@ def main() -> int:
         lines.append(f"[{ts}] 巡检通过 ✅ 全部正常")
 
     report = "\n".join(lines)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
+    # 写入当天归档目录（当天多次巡检覆盖旧版，不追加）
+    with open(LOG_FILE, "w", encoding="utf-8-sig") as f:
         f.write(report + "\n")
 
     # 输出到控制台（供 cron 采集）
     print(report)
-
-    # 仅保留最近约 5000 行，防无限增长
-    try:
-        content = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-        if len(content) > 5000:
-            LOG_FILE.write_text("\n".join(content[-5000:]) + "\n", encoding="utf-8")
-    except Exception:
-        pass
 
     # 有异常给短摘要（便于告警正文）
     if problems:

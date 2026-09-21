@@ -50,6 +50,25 @@ HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8099"))
 BASE_URL = f"http://{HOST}:{PORT}"
 
+# --- 运维归档目录：按天建文件夹（如 2026921），当天多次体检覆盖前一天同名文件 ---
+# 可用环境变量 RAG_OPS_ARCHIVE 覆盖（便于迁移/多环境）
+ARCHIVE_ROOT = Path(os.getenv("RAG_OPS_ARCHIVE", r"E:\测试项目\自建知识库\伏羲运维手册\日志"))
+
+
+def _today_archive_dir() -> Path:
+    """当天归档目录：<ARCHIVE_ROOT>/<YYYYMD>（如 2026921，月和日不补零）。"""
+    now = datetime.now()
+    # 按需求：名称为当天日期且不补零（2026-09-21 → 2026921）
+    day_name = f"{now.year}{now.month}{now.day}"
+    d = ARCHIVE_ROOT / day_name
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # 归档盘不可用（未挂载等）时回退到本地，不让主功能受损
+        d = DATA_DIR / "ops_archive" / day_name
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
 _TAG = "[ragctl]"
 
 
@@ -57,29 +76,45 @@ def _log(msg: str = ""):
     print(f"{_TAG} {msg}" if msg else "")
 
 
-# --- 体检/状态历史落盘（便于回溯“什么时候开始不对的”）---
-DOCTOR_HISTORY = LOG_DIR / "doctor_history.log"
-_HISTORY_MAX_LINES = 8000
+# --- 历史记录：改为「按天归档 + 当天覆盖」---
+# 路径：<ARCHIVE_ROOT>/<YYYYMMDD>/doctor_report.txt（当天多次运行只保留最新）
+# 保留只限于当天，历史日期文件夹不会被触碰（可自行归档/清理）。
+
+def _write_daily_report(name: str, text: str) -> Path:
+    """把一份报告写入当天归档目录（同日多次运行直接覆盖）。"""
+    d = _today_archive_dir()
+    p = d / name
+    with open(p, "w", encoding="utf-8-sig") as f:
+        f.write(text.strip() + "\n")
+    return p
 
 
 def _record_history(kind: str, text: str):
-    """把一次命令的完整输出追加到历史日志（带时间戳），并限长防涨。
+    """把 doctor / status 的完整输出存入当天归档目录（当天内覆盖）。
 
-    首次创建时写 UTF-8 BOM，保证 Windows 记事本/PowerShell 也能正确显示中文。
+    - doctor  → doctor_report.txt（体检报告）
+    - status  → status_report.txt（状态快照）
+    同时合并一份 combined_report.txt，方便一次性查看。
     """
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        is_new = not DOCTOR_HISTORY.exists() or DOCTOR_HISTORY.stat().st_size == 0
-        with open(DOCTOR_HISTORY, "a", encoding="utf-8-sig" if is_new else "utf-8") as f:
-            f.write(f"\n{'=' * 60}\n[{ts}] {kind}\n{'=' * 60}\n{text.strip()}\n")
-        # 控制文件大小：超过上限则保留最后 N 行
-        lines = DOCTOR_HISTORY.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-        if len(lines) > _HISTORY_MAX_LINES:
-            DOCTOR_HISTORY.write_text("\n".join(lines[-_HISTORY_MAX_LINES:]) + "\n",
-                                      encoding="utf-8-sig")
+        body = f"[采集时间] {ts}\n{'=' * 60}\n{text}"
+        if kind == "doctor":
+            _write_daily_report("doctor_report.txt", body)
+        elif kind == "status":
+            _write_daily_report("status_report.txt", body)
+        # 合并报告：当天两个命令都跑过则包含两部分，否则只写现有的
+        d = _today_archive_dir()
+        parts = []
+        for f, title in (("status_report.txt", "状态快照"), ("doctor_report.txt", "体检报告")):
+            fp = d / f
+            if fp.exists():
+                parts.append(f"######## {title} ########\n" + fp.read_text(
+                    encoding="utf-8-sig", errors="replace").rstrip())
+        if parts:
+            _write_daily_report("combined_report.txt", "\n\n".join(parts))
     except Exception:
-        pass  # 历史记录失败绝不影响主命令
+        pass  # 归档失败绝不影响主命令
 
 
 def _capture(fn, *args, **kwargs):
@@ -537,11 +572,12 @@ def _mask_secrets(text: str) -> str:
 
 
 def cmd_diag(_args) -> int:
-    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    # 诊断包也按天归档（当天覆盖）
+    out_dir = _today_archive_dir()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_path = DIAG_DIR / f"diag_{ts}.zip"
+    zip_path = out_dir / "diag_report.zip"
 
-    _log(f"正在打包诊断信息 → {zip_path.name}")
+    _log(f"正在打包诊断信息 → {zip_path}")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         # 1. 状态快照（用 _capture 避免重复实现；直接调 *Impl 避免写冗余历史）
         _c1, status_txt = _capture(_status_impl, None)
@@ -761,23 +797,23 @@ def cmd_fts_reconcile(_args) -> int:
 
 
 def cmd_history(args) -> int:
-    """查看体检/状态历史（doctor 与 status 的历次输出）。"""
-    n = getattr(args, "n", 2)
-    if not DOCTOR_HISTORY.exists():
-        _warn("暂无历史记录（跑一次 ragctl doctor / status 后自动生成）")
-        return 1
-    try:
-        text = DOCTOR_HISTORY.read_text(encoding="utf-8-sig", errors="replace")
-        blocks = text.split("=" * 60)
-        # 每段由分隔线分隔，取末尾 n 段有意义内容
-        sections = [b.strip() for b in text.split("\n" + "=" * 60 + "\n") if b.strip()]
-        for sec in sections[-n:]:
-            print(sec)
-            print()
-        _log(f"共 {len(sections)} 条记录，本次显示最后 {min(n, len(sections))} 条")
-        _log(f"完整历史文件: {DOCTOR_HISTORY}")
-    except Exception as e:
-        _err(f"读取历史失败: {e}")
+    """查看当天归档目录里的运维报告。"""
+    d = _today_archive_dir()
+    _log(f"当日归档目录: {d}")
+    files = [
+        ("combined_report.txt", "合并报告"),
+        ("status_report.txt", "状态快照"),
+        ("doctor_report.txt", "体检报告"),
+    ]
+    shown = False
+    for fn, title in files:
+        p = d / fn
+        if p.exists():
+            print(f"\n######## {title}（{fn}）########")
+            print(p.read_text(encoding="utf-8-sig", errors="replace"))
+            shown = True
+    if not shown:
+        _warn("当日尚无报告（跑一次 ragctl doctor / status 自动生成）")
         return 1
     return 0
 
