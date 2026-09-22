@@ -130,3 +130,35 @@ checkout/checkin 流程（Web UI 或 op.CheckOutDocument.php / op.CheckInDocumen
 
 因此伏羲的「自动替换」触发依赖 SeedDMS 里文档内容真实变化（hash 变化检测），
 而内容变化由用户在 SeedDMS 侧通过正规 checkin 流程完成。伏羲侧检测到 hash 变化即自动替换。
+
+### 11.1 上传大小限制（2026-09-22 调整）
+
+上传闸门有两道，调整需两边都照顾：
+
+| 闸门 | 位置 | 旧值 | 现值 | 说明 |
+| --- | --- | --- | --- | --- |
+| SeedDMS PHP | 容器内 `/usr/local/etc/php/conf.d/seeddms-php.ini` | `upload_max_filesize=66M` / `post_max_size=68M` / `memory_limit=256M` | `2048M` / `2048M` / `1024M`（另 `max_execution_time=3600`） | 仅影响 **SeedDMS Web UI 上传**（走 PHP HTTP 层） |
+| 伏羲后端 | `.env` `MAX_UPLOAD_SIZE_MB` | 200 | 2048 | 伏羲前端上传上限（`UPLOAD_TIMEOUT=3600` 同步放大） |
+
+**重要**：伏羲的浏览器上传走「直接写库」路线（`src/dms/writer.py` 绕过 PHP），**不受 SeedDMS 的 66M/2G 限制**，只受伏羲侧 `MAX_UPLOAD_SIZE_MB` 约束。SeedDMS PHP 上限只对「登录 DMS 网页上传」生效。
+
+**改 SeedDMS PHP 上限的正确姿势**（容器内 php.ini 不在 bind mount 上）：
+
+```bash
+# 1) 进容器改 ini（2G 图纸场景）
+docker exec seeddms sh -c "cat > /usr/local/etc/php/conf.d/seeddms-php.ini <<'EOF'
+memory_limit = 1024M
+upload_max_filesize = 2048M
+post_max_size = 2048M
+max_execution_time = 3600
+max_input_time = 3600
+EOF"
+# 2) 重启容器生效
+docker restart seeddms
+# 3) 固化镜像（否则重建容器会丢）
+docker commit seeddms seeddms-fuxi:latest
+# 4) 验证
+docker exec seeddms php -i | grep -E '^(upload_max_filesize|post_max_size|memory_limit)'
+```
+
+⚠️ 红线：容量提升只解除「大小拦截」，**大图纸仍建议走伏羲流式入库**（`RAG_STREAM_INGEST`）以降低解析/OCR/向量化的耗时与内存占用。

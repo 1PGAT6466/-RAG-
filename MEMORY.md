@@ -60,6 +60,7 @@
 - API 只读，无创建文档能力 → 上传走「直接写库」路线。
 - 表格预览：`op.TablePreview.php`（PhpSpreadsheet + 服务端分页 1000 行/页）。
 - 运维手册已交付（2026-09-21，含备份/重建/红线）。
+- **上传大小（2026-09-22 调至 2G，为适应大图纸）**：两道闸门——① SeedDMS PHP（容器 `/usr/local/etc/php/conf.d/seeddms-php.ini`，非 bind mount，改后 `docker restart` + `docker commit seeddms seeddms-fuxi:latest`）；② 伏羲 `.env MAX_UPLOAD_SIZE_MB`。旧值 66M/68M/256M + 200MB → 现 2048M/2048M/1024M + 2048（`UPLOAD_TIMEOUT=3600`）。**伏羲浏览器上传走直写库不经 PHP，只受 MAX_UPLOAD_SIZE_MB 约束**；SeedDMS PHP 上限只对 DMS 网页上传生效。详见 `docs/SeedDMS接入方案.md` §11.1。
 
 ## 近期已落地（2026-09-21，《问题整改清单》核查 + 批量修复）
 
